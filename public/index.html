@@ -41,18 +41,26 @@
     <!-- Sidebar -->
     <aside id="sidebar" class="sidebar">
       <div class="sidebar-header">
-        <div class="new-chat-split">
-          <button id="new-chat-btn" class="new-chat-btn">+ 新会话</button>
-          <button id="new-chat-arrow" class="new-chat-arrow" title="更多">▾</button>
+        <div class="sidebar-header-actions">
+          <div class="new-chat-split">
+            <button id="new-chat-btn" class="new-chat-btn">+ 新会话</button>
+            <button id="new-chat-arrow" class="new-chat-arrow" title="更多">▾</button>
+          </div>
+          <button id="settings-btn" class="settings-btn settings-btn-top" title="设置">⚙</button>
         </div>
         <div id="new-chat-dropdown" class="new-chat-dropdown" hidden>
           <button id="import-session-btn">导入本地 CLI 会话</button>
         </div>
       </div>
       <div id="session-list" class="session-list"></div>
-      <div class="sidebar-footer">
-        <button id="settings-btn" class="settings-btn" title="设置">⚙</button>
-        <span class="brand">CC-Web</span>
+      <div id="sidebar-tools-height-resizer" class="sidebar-tools-height-resizer" role="separator" aria-label="调整工具区域高度" aria-orientation="horizontal"></div>
+      <div id="sidebar-tools" class="sidebar-tools">
+        <div class="sidebar-tool-tabs">
+          <button id="tool-tab-files" class="sidebar-tool-tab active" type="button">文件浏览</button>
+          <button id="tool-tab-cmd" class="sidebar-tool-tab" type="button">命令执行</button>
+        </div>
+        <div id="file-browser-panel" class="file-browser-panel"></div>
+        <div id="cmd-panel" class="cmd-panel" hidden></div>
       </div>
     </aside>
 

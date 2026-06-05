@@ -30,9 +30,21 @@ const MAX_MESSAGE_ATTACHMENTS = 4;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
+const AUTH_TOKENS_PATH = path.join(CONFIG_DIR, 'auth_tokens.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
+const COMMAND_HISTORY_PATH = path.join(CONFIG_DIR, 'command-history.json');
+const activeExecByToken = new Map();
+const activeWsByToken = new Map();
+const IS_ROOT_OR_SUDO = (() => {
+  try {
+    if (typeof process.env.SUDO_USER === 'string' && process.env.SUDO_USER) return true;
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return true;
+    if (typeof process.geteuid === 'function' && process.geteuid() === 0) return true;
+  } catch {}
+  return false;
+})();
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -440,26 +452,73 @@ function ensureAuthLoaded() {
   return authConfig;
 }
 
+function reloadAuthConfig() {
+  authConfig = loadAuthConfig();
+  PASSWORD = authConfig.password;
+  return authConfig;
+}
+
 const activeTokens = new Map(); // token -> lastActive timestamp
 
 const TOKEN_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+function saveAuthTokens() {
+  const obj = Object.fromEntries(activeTokens);
+  try {
+    fs.writeFileSync(AUTH_TOKENS_PATH, JSON.stringify(obj, null, 2));
+  } catch {}
+}
+
+function loadAuthTokens() {
+  try {
+    if (!fs.existsSync(AUTH_TOKENS_PATH)) return;
+    const data = JSON.parse(fs.readFileSync(AUTH_TOKENS_PATH, 'utf8'));
+    const now = Date.now();
+    for (const [token, ts] of Object.entries(data || {})) {
+      const lastActive = Number(ts);
+      if (token && Number.isFinite(lastActive) && now - lastActive <= TOKEN_TTL) {
+        activeTokens.set(token, lastActive);
+      }
+    }
+    saveAuthTokens();
+  } catch {}
+}
+
+function rememberAuthToken(token) {
+  if (!token) return;
+  activeTokens.set(token, Date.now());
+  saveAuthTokens();
+}
+
+function clearAuthTokens() {
+  activeTokens.clear();
+  saveAuthTokens();
+}
 
 function isTokenValid(token) {
   if (!token || !activeTokens.has(token)) return false;
   const now = Date.now();
   if (now - activeTokens.get(token) > TOKEN_TTL) {
     activeTokens.delete(token);
+    saveAuthTokens();
     return false;
   }
-  activeTokens.set(token, now);
+  rememberAuthToken(token);
   return true;
 }
 
+loadAuthTokens();
+
 setInterval(() => {
   const now = Date.now();
+  let changed = false;
   for (const [token, ts] of activeTokens) {
-    if (now - ts > TOKEN_TTL) activeTokens.delete(token);
+    if (now - ts > TOKEN_TTL) {
+      activeTokens.delete(token);
+      changed = true;
+    }
   }
+  if (changed) saveAuthTokens();
 }, 6 * 60 * 60 * 1000).unref();
 
 // === Anti-brute-force ===
@@ -499,6 +558,8 @@ function loadBannedIPs() {
       } else {
         bannedIPs = new Map(Object.entries(data).map(([ip, t]) => [ip, Number(t)]));
       }
+    } else {
+      bannedIPs = new Map();
     }
   } catch { bannedIPs = new Map(); }
 }
@@ -508,11 +569,16 @@ function saveBannedIPs() {
 }
 loadBannedIPs();
 
+function normalizeClientIP(ip) {
+  return String(ip || '').trim().replace(/^::ffff:/, '');
+}
+
 function isBanned(ip) {
-  if (!ip || !bannedIPs.has(ip)) return false;
-  const exp = bannedIPs.get(ip);
+  const normalized = normalizeClientIP(ip);
+  if (!normalized || !bannedIPs.has(normalized)) return false;
+  const exp = bannedIPs.get(normalized);
   if (exp !== -1 && Date.now() > exp) {
-    bannedIPs.delete(ip);
+    bannedIPs.delete(normalized);
     saveBannedIPs();
     return false;
   }
@@ -520,20 +586,82 @@ function isBanned(ip) {
 }
 
 function recordAuthFailure(ip) {
-  if (!ip || isWhitelistedIP(ip)) return false;
+  const normalized = normalizeClientIP(ip);
+  if (!normalized || isWhitelistedIP(normalized)) return false;
   const now = Date.now();
-  let list = authFailures.get(ip) || [];
+  let list = authFailures.get(normalized) || [];
   list.push(now);
   list = list.filter(t => now - t < AUTH_FAIL_WINDOW);
-  authFailures.set(ip, list);
+  authFailures.set(normalized, list);
   if (list.length >= AUTH_FAIL_MAX) {
-    bannedIPs.set(ip, Date.now() + BAN_DURATION);
+    bannedIPs.set(normalized, Date.now() + BAN_DURATION);
     saveBannedIPs();
-    authFailures.delete(ip);
-    plog('WARN', 'ip_banned', { ip, reason: `${AUTH_FAIL_MAX} failed auth in ${AUTH_FAIL_WINDOW / 1000}s` });
+    authFailures.delete(normalized);
+    plog('WARN', 'ip_banned', { ip: normalized, reason: `${AUTH_FAIL_MAX} failed auth in ${AUTH_FAIL_WINDOW / 1000}s` });
     return true;
   }
   return false;
+}
+
+function getBanInfo(ip) {
+  const normalized = normalizeClientIP(ip);
+  if (!normalized || !isBanned(normalized)) return null;
+  const expiresAt = Number(bannedIPs.get(normalized));
+  const now = Date.now();
+  const remainingMs = expiresAt === -1 ? -1 : Math.max(0, expiresAt - now);
+  return {
+    ip: normalized,
+    expiresAt,
+    expiresAtIso: expiresAt === -1 ? null : new Date(expiresAt).toISOString(),
+    remainingMs,
+    permanent: expiresAt === -1,
+  };
+}
+
+function listBannedIPs() {
+  const now = Date.now();
+  const entries = [];
+  for (const [ip, expiresAtRaw] of bannedIPs.entries()) {
+    const info = getBanInfo(ip);
+    if (!info) continue;
+    entries.push({
+      ip: normalizeClientIP(ip),
+      expiresAt: Number(expiresAtRaw),
+      expiresAtIso: info.expiresAtIso,
+      remainingMs: info.remainingMs,
+      permanent: info.permanent,
+      whitelisted: isWhitelistedIP(ip),
+      bannedAtIso: expiresAtRaw === -1 ? null : new Date(Number(expiresAtRaw) - BAN_DURATION).toISOString(),
+      active: info.permanent || Number(expiresAtRaw) > now,
+    });
+  }
+  entries.sort((a, b) => {
+    if (a.permanent !== b.permanent) return a.permanent ? -1 : 1;
+    return (b.expiresAt || 0) - (a.expiresAt || 0);
+  });
+  return entries;
+}
+
+function unbanIP(ip) {
+  const normalized = normalizeClientIP(ip);
+  if (!normalized) return false;
+  const existed = bannedIPs.delete(normalized);
+  authFailures.delete(normalized);
+  if (existed) {
+    saveBannedIPs();
+    plog('INFO', 'ip_unbanned', { ip: normalized });
+  }
+  return existed;
+}
+
+function clearAllBannedIPs() {
+  if (!bannedIPs.size) return 0;
+  const count = bannedIPs.size;
+  bannedIPs.clear();
+  authFailures.clear();
+  saveBannedIPs();
+  plog('INFO', 'all_ips_unbanned', { count });
+  return count;
 }
 
 // Pending slash command metadata: sessionId -> { kind: string }
@@ -1065,6 +1193,38 @@ function wsSend(ws, data, dropIfBacklogged = false) {
   ws.send(JSON.stringify(data));
 }
 
+function registerWsToken(token, ws) {
+  if (!token || !ws) return;
+  let sockets = activeWsByToken.get(token);
+  if (!sockets) {
+    sockets = new Set();
+    activeWsByToken.set(token, sockets);
+  }
+  sockets.add(ws);
+}
+
+function unregisterWsToken(token, ws) {
+  if (!token || !ws) return;
+  const sockets = activeWsByToken.get(token);
+  if (!sockets) return;
+  sockets.delete(ws);
+  if (sockets.size === 0) activeWsByToken.delete(token);
+}
+
+function wsSendByToken(token, data, dropIfBacklogged = false) {
+  if (!token) return;
+  const sockets = activeWsByToken.get(token);
+  if (!sockets || sockets.size === 0) return;
+  for (const ws of Array.from(sockets)) {
+    if (!ws || ws.readyState !== 1) {
+      sockets.delete(ws);
+      continue;
+    }
+    wsSend(ws, data, dropIfBacklogged);
+  }
+  if (sockets.size === 0) activeWsByToken.delete(token);
+}
+
 function sanitizeId(id) {
   return String(id).replace(/[^a-zA-Z0-9\-]/g, '');
 }
@@ -1207,6 +1367,118 @@ function jsonResponse(res, statusCode, payload) {
     'Cache-Control': 'no-cache',
   });
   res.end(JSON.stringify(payload));
+}
+
+function readJsonBody(req, maxBytes = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error('请求体过大'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve(text ? JSON.parse(text) : {});
+      } catch (err) {
+        reject(new Error('JSON 解析失败'));
+      }
+    });
+    req.on('error', () => reject(new Error('读取请求体失败')));
+  });
+}
+
+function normalizeCommandHistory(list, limit = 30) {
+  const deduped = [];
+  for (const item of Array.isArray(list) ? list : []) {
+    const cmd = String(item || '').trim();
+    if (!cmd || deduped.includes(cmd)) continue;
+    deduped.push(cmd);
+    if (deduped.length >= limit) break;
+  }
+  return deduped;
+}
+
+function loadCommandHistoryFromDisk() {
+  try {
+    if (!fs.existsSync(COMMAND_HISTORY_PATH)) return [];
+    const raw = JSON.parse(fs.readFileSync(COMMAND_HISTORY_PATH, 'utf8'));
+    return normalizeCommandHistory(raw?.history || []);
+  } catch {
+    return [];
+  }
+}
+
+function saveCommandHistoryToDisk(list) {
+  const history = normalizeCommandHistory(list);
+  const payload = { history, updatedAt: new Date().toISOString() };
+  fs.writeFileSync(COMMAND_HISTORY_PATH, JSON.stringify(payload, null, 2), 'utf8');
+  return history;
+}
+
+function resolveFsPath(rawPath) {
+  const input = String(rawPath || '').trim();
+  const base = process.cwd();
+  const candidate = input ? (path.isAbsolute(input) ? input : path.join(base, input)) : base;
+  return path.resolve(candidate);
+}
+
+function runShellCommand(command, cwd, timeoutMs = 600000, options = {}) {
+  return new Promise((resolve, reject) => {
+    const targetCwd = resolveFsPath(cwd || '');
+    const shell = process.platform === 'win32' ? 'cmd.exe' : 'bash';
+    const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
+    const env = { ...process.env };
+    if (/\bdocker(?:-compose|\s+compose)\b/i.test(String(command || '')) && !env.COMPOSE_STATUS_STDOUT) {
+      env.COMPOSE_STATUS_STDOUT = '1';
+    }
+    const child = spawn(shell, args, { cwd: targetCwd, env });
+    if (typeof options.onSpawn === 'function') {
+      try { options.onSpawn(child, targetCwd); } catch {}
+    }
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGKILL'); } catch {}
+    }, Math.max(1000, Number(timeoutMs) || 600000));
+
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      if (typeof options.onStdout === 'function') {
+        try { options.onStdout(text); } catch {}
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      if (typeof options.onStderr === 'function') {
+        try { options.onStderr(text); } catch {}
+      }
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      if (typeof options.onDone === 'function') {
+        try { options.onDone(); } catch {}
+      }
+      reject(err);
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (typeof options.onDone === 'function') {
+        try { options.onDone(); } catch {}
+      }
+      resolve({ stdout, stderr, code: code ?? -1, signal: signal || null, timedOut, cwd: targetCwd });
+    });
+  });
 }
 
 const INITIAL_HISTORY_COUNT = 12;
@@ -1888,6 +2160,325 @@ const server = http.createServer((req, res) => {
     return jsonResponse(res, 200, { ok: true });
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/fs/list') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    try {
+      const dirPath = resolveFsPath(url.searchParams.get('path') || '');
+      const stat = fs.statSync(dirPath);
+      if (!stat.isDirectory()) return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true }).map((entry) => {
+        const fullPath = path.join(dirPath, entry.name);
+        let size = 0;
+        let mtime = null;
+        try {
+          const s = fs.statSync(fullPath);
+          size = s.isFile() ? s.size : 0;
+          mtime = s.mtime.toISOString();
+        } catch {}
+        return {
+          name: entry.name,
+          path: fullPath,
+          type: entry.isDirectory() ? 'dir' : 'file',
+          size,
+          mtime,
+        };
+      }).sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      const parentPath = path.dirname(dirPath);
+      return jsonResponse(res, 200, {
+        ok: true,
+        cwd: dirPath,
+        parent: parentPath !== dirPath ? parentPath : null,
+        entries,
+      });
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: `读取目录失败: ${err.message}` });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/fs/read') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    try {
+      const filePath = resolveFsPath(url.searchParams.get('path') || '');
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
+      if (stat.size > 1024 * 1024) return jsonResponse(res, 413, { ok: false, message: '文件超过 1MB，暂不支持在线编辑' });
+      const content = fs.readFileSync(filePath, 'utf8');
+      return jsonResponse(res, 200, { ok: true, path: filePath, content, size: stat.size });
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: `读取文件失败: ${err.message}` });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/fs/write') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then((body) => {
+      try {
+        const filePath = resolveFsPath(body.path || '');
+        const content = typeof body.content === 'string' ? body.content : '';
+        fs.writeFileSync(filePath, content, 'utf8');
+        return jsonResponse(res, 200, { ok: true, path: filePath, size: Buffer.byteLength(content, 'utf8') });
+      } catch (err) {
+        return jsonResponse(res, 400, { ok: false, message: `保存文件失败: ${err.message}` });
+      }
+    }).catch((err) => {
+      return jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' });
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/fs/download') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    try {
+      const filePath = resolveFsPath(url.searchParams.get('path') || '');
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
+      const filename = path.basename(filePath);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+        'Cache-Control': 'no-cache',
+      });
+      fs.createReadStream(filePath).pipe(res);
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: `下载文件失败: ${err.message}` });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/fs/mkdir') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then((body) => {
+      try {
+        const baseDir = resolveFsPath(body.basePath || '');
+        const name = String(body.name || '').trim();
+        if (!name || name.includes('/') || name.includes('\\')) return jsonResponse(res, 400, { ok: false, message: '目录名非法' });
+        const target = path.join(baseDir, name);
+        fs.mkdirSync(target, { recursive: false });
+        return jsonResponse(res, 200, { ok: true, path: target });
+      } catch (err) {
+        return jsonResponse(res, 400, { ok: false, message: `新建目录失败: ${err.message}` });
+      }
+    }).catch((err) => jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' }));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/fs/create') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then((body) => {
+      try {
+        const baseDir = resolveFsPath(body.basePath || '');
+        const name = String(body.name || '').trim();
+        const content = typeof body.content === 'string' ? body.content : '';
+        if (!name || name.includes('/') || name.includes('\\')) return jsonResponse(res, 400, { ok: false, message: '文件名非法' });
+        const target = path.join(baseDir, name);
+        fs.writeFileSync(target, content, { flag: 'wx', encoding: 'utf8' });
+        return jsonResponse(res, 200, { ok: true, path: target });
+      } catch (err) {
+        return jsonResponse(res, 400, { ok: false, message: `新建文件失败: ${err.message}` });
+      }
+    }).catch((err) => jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' }));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/fs/rename') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then((body) => {
+      try {
+        const sourcePath = resolveFsPath(body.path || '');
+        const newName = String(body.newName || '').trim();
+        if (!newName || newName.includes('/') || newName.includes('\\')) return jsonResponse(res, 400, { ok: false, message: '新名称非法' });
+        const targetPath = path.join(path.dirname(sourcePath), newName);
+        fs.renameSync(sourcePath, targetPath);
+        return jsonResponse(res, 200, { ok: true, path: targetPath });
+      } catch (err) {
+        return jsonResponse(res, 400, { ok: false, message: `重命名失败: ${err.message}` });
+      }
+    }).catch((err) => jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' }));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/fs/delete') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then((body) => {
+      try {
+        const targetPath = resolveFsPath(body.path || '');
+        const stat = fs.statSync(targetPath);
+        if (stat.isDirectory()) fs.rmSync(targetPath, { recursive: true, force: false });
+        else fs.unlinkSync(targetPath);
+        return jsonResponse(res, 200, { ok: true });
+      } catch (err) {
+        return jsonResponse(res, 400, { ok: false, message: `删除失败: ${err.message}` });
+      }
+    }).catch((err) => jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/exec/history') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    return jsonResponse(res, 200, { ok: true, history: loadCommandHistoryFromDisk() });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/exec/history') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then((body) => {
+      try {
+        const history = saveCommandHistoryToDisk(body?.history || []);
+        return jsonResponse(res, 200, { ok: true, history });
+      } catch (err) {
+        return jsonResponse(res, 400, { ok: false, message: `保存历史命令失败: ${err.message}` });
+      }
+    }).catch((err) => jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/exec/current') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    const running = activeExecByToken.get(token);
+    if (!running?.child) {
+      return jsonResponse(res, 200, { ok: true, running: false });
+    }
+    return jsonResponse(res, 200, {
+      ok: true,
+      running: true,
+      execId: running.execId || '',
+      command: running.command || '',
+      cwd: running.cwd || '',
+      stdout: running.stdout || '',
+      stderr: running.stderr || '',
+      startedAt: running.startedAt || '',
+      stopInProgress: !!running.stopping,
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/exec/stop') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    const running = activeExecByToken.get(token);
+    if (!running?.child) return jsonResponse(res, 200, { ok: true, stopped: false, message: '当前没有正在执行的命令' });
+    try {
+      running.stopping = true;
+      wsSendByToken(token, {
+        type: 'exec_stream',
+        event: 'stop_requested',
+        execId: running.execId || '',
+        command: running.command || '',
+      });
+      running.child.kill('SIGTERM');
+      setTimeout(() => {
+        try {
+          if (!running.child.killed) running.child.kill('SIGKILL');
+        } catch {}
+      }, 1200);
+      return jsonResponse(res, 200, { ok: true, stopped: true, message: '已发送停止信号' });
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: `停止命令失败: ${err.message}` });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/exec/run') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    readJsonBody(req).then(async (body) => {
+      const execState = {
+        child: null,
+        command: '',
+        cwd: '',
+        stdout: '',
+        stderr: '',
+        startedAt: new Date().toISOString(),
+        stopping: false,
+        execId: crypto.randomUUID(),
+      };
+      try {
+        const command = String(body.command || '').trim();
+        const cwd = String(body.cwd || '').trim();
+        const timeoutMs = Math.min(1800000, Math.max(1000, Number(body.timeoutMs) || 600000));
+        if (!command) return jsonResponse(res, 400, { ok: false, message: '命令不能为空' });
+        const current = activeExecByToken.get(token);
+        if (current?.child) {
+          return jsonResponse(res, 409, { ok: false, message: '已有命令正在执行，请先停止后再执行新命令' });
+        }
+        execState.command = command;
+        const result = await runShellCommand(command, cwd, timeoutMs, {
+          onSpawn: (child, targetCwd) => {
+            execState.child = child;
+            execState.cwd = targetCwd;
+            activeExecByToken.set(token, execState);
+            wsSendByToken(token, {
+              type: 'exec_stream',
+              event: 'start',
+              execId: execState.execId,
+              command,
+              cwd: targetCwd,
+              startedAt: execState.startedAt,
+            });
+          },
+          onStdout: (text) => {
+            execState.stdout += text;
+            wsSendByToken(token, {
+              type: 'exec_stream',
+              event: 'stdout',
+              execId: execState.execId,
+              text,
+            }, true);
+          },
+          onStderr: (text) => {
+            execState.stderr += text;
+            wsSendByToken(token, {
+              type: 'exec_stream',
+              event: 'stderr',
+              execId: execState.execId,
+              text,
+            }, true);
+          },
+          onDone: () => {
+            const active = activeExecByToken.get(token);
+            if (active === execState) activeExecByToken.delete(token);
+          },
+        });
+        wsSendByToken(token, {
+          type: 'exec_stream',
+          event: 'end',
+          execId: execState.execId,
+          command,
+          cwd: result.cwd,
+          code: result.code,
+          signal: result.signal,
+          timedOut: !!result.timedOut,
+          stopping: !!execState.stopping,
+          finishedAt: new Date().toISOString(),
+        });
+        return jsonResponse(res, 200, { ok: true, execId: execState.execId, ...result });
+      } catch (err) {
+        activeExecByToken.delete(token);
+        wsSendByToken(token, {
+          type: 'exec_stream',
+          event: 'error',
+          execId: execState.execId,
+          command: execState.command || '',
+          cwd: execState.cwd || '',
+          message: err.message || '执行失败',
+        });
+        return jsonResponse(res, 400, { ok: false, message: `执行失败: ${err.message}` });
+      }
+    }).catch((err) => jsonResponse(res, 400, { ok: false, message: err.message || '请求无效' }));
+    return;
+  }
+
   let filePath = path.join(PUBLIC_DIR, url.pathname === '/' ? 'index.html' : url.pathname);
   filePath = path.resolve(filePath);
 
@@ -1915,13 +2506,13 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
   const forwarded = req.headers['x-forwarded-for'];
-  const clientIP = forwarded ? forwarded.split(',')[0].trim()
-    : req.socket?.remoteAddress || null;
+  const clientIP = normalizeClientIP(forwarded ? forwarded.split(',')[0].trim()
+    : req.socket?.remoteAddress || null);
 
   // Check if IP is banned
   if (clientIP && isBanned(clientIP)) {
     plog('WARN', 'banned_ip_rejected', { ip: clientIP });
-    wsSend(ws, { type: 'auth_result', success: false, banned: true });
+    wsSend(ws, { type: 'auth_result', success: false, banned: true, banInfo: getBanInfo(clientIP) });
     ws.close();
     return;
   }
@@ -1941,23 +2532,42 @@ wss.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'auth') {
-      ensureAuthLoaded();
+      reloadAuthConfig();
+      loadBannedIPs();
       // Check ban before processing auth
       if (clientIP && isBanned(clientIP)) {
-        wsSend(ws, { type: 'auth_result', success: false, banned: true });
+        wsSend(ws, { type: 'auth_result', success: false, banned: true, banInfo: getBanInfo(clientIP) });
         ws.close();
         return;
       }
       const tokenValid = isTokenValid(msg.token);
       if (msg.password === PASSWORD || tokenValid) {
+        if (authToken && authToken !== msg.token) unregisterWsToken(authToken, ws);
         authToken = tokenValid ? msg.token : crypto.randomBytes(32).toString('hex');
-        activeTokens.set(authToken, Date.now());
+        rememberAuthToken(authToken);
         authenticated = true;
-        wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
+        registerWsToken(authToken, ws);
+        wsSend(ws, {
+          type: 'auth_result',
+          success: true,
+          token: authToken,
+          mustChangePassword: !!authConfig.mustChange,
+          isRootOrSudo: IS_ROOT_OR_SUDO,
+        });
         sendSessionList(ws);
       } else {
-        const justBanned = recordAuthFailure(clientIP);
-        wsSend(ws, { type: 'auth_result', success: false, banned: justBanned });
+        const triedPassword = typeof msg.password === 'string' && msg.password.length > 0;
+        const justBanned = triedPassword ? recordAuthFailure(clientIP) : false;
+        wsSend(ws, {
+          type: 'auth_result',
+          success: false,
+          banned: isBanned(clientIP),
+          banInfo: getBanInfo(clientIP),
+          remainingAttempts: triedPassword
+            ? (justBanned ? 0 : Math.max(0, AUTH_FAIL_MAX - ((authFailures.get(clientIP) || []).length)))
+            : AUTH_FAIL_MAX,
+          tokenExpired: !tokenValid && !triedPassword,
+        });
         if (justBanned) ws.close();
       }
       return;
@@ -2009,7 +2619,23 @@ wss.on('connection', (ws, req) => {
         handleTestNotify(ws);
         break;
       case 'change_password':
-        handleChangePassword(ws, msg, authToken);
+        {
+          const newToken = handleChangePassword(ws, msg, authToken);
+          if (newToken) {
+            unregisterWsToken(authToken, ws);
+            authToken = newToken;
+            registerWsToken(authToken, ws);
+          }
+        }
+        break;
+      case 'get_security_status':
+        handleGetSecurityStatus(ws, clientIP);
+        break;
+      case 'unban_ip':
+        handleUnbanIP(ws, msg.ip, clientIP);
+        break;
+      case 'clear_banned_ips':
+        handleClearBannedIPs(ws, clientIP);
         break;
       case 'get_model_config':
         wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
@@ -2067,10 +2693,10 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => handleDisconnect(ws, wsId));
+  ws.on('close', () => handleDisconnect(ws, wsId, authToken));
   ws.on('error', (err) => {
     plog('WARN', 'ws_error', { wsId, error: err.message });
-    handleDisconnect(ws, wsId);
+    handleDisconnect(ws, wsId, authToken);
   });
 });
 
@@ -2126,6 +2752,8 @@ function handleTestNotify(ws) {
 function handleChangePassword(ws, msg, currentToken) {
   const { currentPassword, newPassword } = msg;
 
+  reloadAuthConfig();
+
   // Validate current password
   if (currentPassword !== PASSWORD) {
     return wsSend(ws, { type: 'password_changed', success: false, message: '当前密码错误' });
@@ -2144,13 +2772,52 @@ function handleChangePassword(ws, msg, currentToken) {
   plog('INFO', 'password_changed', {});
 
   // Clear all tokens (force all sessions to re-login)
-  activeTokens.clear();
+  clearAuthTokens();
+  activeWsByToken.clear();
 
   // Generate new token for current connection
   const newToken = crypto.randomBytes(32).toString('hex');
-  activeTokens.set(newToken, Date.now());
+  rememberAuthToken(newToken);
 
   wsSend(ws, { type: 'password_changed', success: true, token: newToken, message: '密码修改成功' });
+  return newToken;
+}
+
+function handleGetSecurityStatus(ws, clientIP) {
+  wsSend(ws, {
+    type: 'security_status',
+    currentIp: normalizeClientIP(clientIP),
+    banDurationMs: BAN_DURATION,
+    failWindowMs: AUTH_FAIL_WINDOW,
+    failMax: AUTH_FAIL_MAX,
+    whitelist: Array.from(EXTRA_WHITELIST_IPS).sort(),
+    bannedIPs: listBannedIPs(),
+    currentBan: getBanInfo(clientIP),
+  });
+}
+
+function handleUnbanIP(ws, ip, clientIP) {
+  const normalized = normalizeClientIP(ip);
+  if (!normalized) {
+    return wsSend(ws, { type: 'security_action_result', success: false, message: 'IP 不能为空' });
+  }
+  const removed = unbanIP(normalized);
+  wsSend(ws, {
+    type: 'security_action_result',
+    success: removed,
+    message: removed ? `已解封 ${normalized}` : `${normalized} 不在封禁列表中`,
+  });
+  handleGetSecurityStatus(ws, clientIP);
+}
+
+function handleClearBannedIPs(ws, clientIP) {
+  const count = clearAllBannedIPs();
+  wsSend(ws, {
+    type: 'security_action_result',
+    success: true,
+    message: count ? `已清空 ${count} 条封禁记录` : '当前没有封禁记录',
+  });
+  handleGetSecurityStatus(ws, clientIP);
 }
 
 // === Model Config Handler ===
@@ -2641,7 +3308,17 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 		    case '/mode': {
 		      const modeInput = parts[1];
 		      const VALID_MODES = ['default', 'plan', 'yolo'];
-		      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
+		      const MODE_DESC = agent === 'codex'
+		        ? {
+		            default: '默认（Codex full-auto，可直接执行并修改文件）',
+		            plan: 'Plan（只读沙箱，适合先分析方案）',
+		            yolo: 'YOLO（跳过审批与沙箱限制）',
+		          }
+		        : {
+		            default: '默认（需权限审批，受限操作）',
+		            plan: 'Plan（需确认计划后执行）',
+		            yolo: 'YOLO（跳过所有权限检查）',
+		          };
 		      if (!modeInput) {
 		        const cur = session?.permissionMode || 'yolo';
 		        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
@@ -2661,13 +3338,13 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       break;
     }
 
-    case '/help': {
-      const base = '可用指令:\n' +
-        '/clear — 清除当前会话（含上下文）\n' +
-        '/mode [模式] — 查看/切换权限模式（default, plan, yolo）\n' +
-        '/cost — 查看当前会话累计统计\n' +
-        '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
-        '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
+	    case '/help': {
+	      const base = '可用指令:\n' +
+	        '/clear — 清除当前会话（含上下文）\n' +
+	        `/mode [模式] — 查看/切换权限模式（default, plan, yolo${agent === 'codex' ? '；其中 plan 为只读' : ''}）\n` +
+	        '/cost — 查看当前会话累计统计\n' +
+	        '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
+	        '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
         '/help — 显示本帮助';
       wsSend(ws, {
         type: 'system_message',
@@ -2982,7 +3659,7 @@ function handleRenameSession(ws, sessionId, title) {
 		  wsSend(ws, { type: 'mode_changed', mode });
 		}
 
-function handleDisconnect(ws, wsId) {
+function handleDisconnect(ws, wsId, authToken = null) {
   const affectedSessions = [];
   for (const [sid, entry] of activeProcesses) {
     if (entry.ws === ws) {
@@ -2991,6 +3668,7 @@ function handleDisconnect(ws, wsId) {
       affectedSessions.push({ sessionId: sid.slice(0, 8), pid: entry.pid });
     }
   }
+  unregisterWsToken(authToken, ws);
   wsSessionMap.delete(ws);
   plog('INFO', 'ws_disconnect', { wsId, activeProcessesAffected: affectedSessions });
 }
@@ -3205,10 +3883,29 @@ function handleMessage(ws, msg, options = {}) {
     fs.closeSync(outputFd);
     fs.closeSync(errorFd);
     cleanRunDir(currentSessionId);
-    plog('ERROR', 'process_spawn_fail', { sessionId: currentSessionId.slice(0, 8), error: err.message });
+    plog('ERROR', 'process_spawn_fail', {
+      sessionId: currentSessionId.slice(0, 8),
+      error: err.message,
+      command: spawnSpec.command,
+      cwd: spawnSpec.cwd,
+      path: spawnSpec.env?.PATH || null,
+    });
     const agent = getSessionAgent(session);
     return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
   }
+
+  proc.on('error', (err) => {
+    plog('ERROR', 'process_spawn_fail', {
+      sessionId: currentSessionId.slice(0, 8),
+      error: err.message,
+      command: spawnSpec.command,
+      cwd: spawnSpec.cwd,
+      path: spawnSpec.env?.PATH || null,
+    });
+    cleanRunDir(currentSessionId);
+    const agent = getSessionAgent(session);
+    wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
+  });
 
   fs.closeSync(outputFd);
   fs.closeSync(errorFd);
@@ -3225,6 +3922,8 @@ function handleMessage(ws, msg, options = {}) {
     resume: spawnSpec.resume,
     codexHomeDir: spawnSpec.codexHomeDir || null,
     codexRuntimeKey: spawnSpec.codexRuntimeKey || null,
+    command: spawnSpec.command,
+    cwd: spawnSpec.cwd,
     args: spawnSpec.args.join(' '),
   });
 

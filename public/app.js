@@ -40,11 +40,40 @@
     { value: 'haiku', label: 'Haiku', desc: '最快速，适合简单任务' },
   ];
 
-  const MODE_PICKER_OPTIONS = [
-    { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
-    { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
-    { value: 'default', label: '默认', desc: '标准权限审批' },
-  ];
+  function getModePickerOptions(agent = currentAgent) {
+    if (normalizeAgent(agent) === 'codex') {
+      return [
+        {
+          value: 'yolo',
+          label: 'YOLO',
+          desc: '直接放开审批与沙箱限制',
+        },
+        { value: 'default', label: '默认', desc: 'Codex full-auto，可直接执行并修改文件' },
+        { value: 'plan', label: 'Plan', desc: '只读沙箱，适合先分析方案，不能直接改文件' },
+      ];
+    }
+    return [
+      {
+        value: 'yolo',
+        label: 'YOLO',
+        desc: isRootOrSudo ? '当前为 root/sudo 环境，会自动降级为默认模式' : '跳过所有权限检查',
+      },
+      { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
+      { value: 'default', label: '默认', desc: '标准权限审批' },
+    ];
+  }
+
+  function currentModeDescription(mode, agent = currentAgent) {
+    if (normalizeAgent(agent) === 'codex') {
+      if (mode === 'yolo') return 'YOLO（跳过审批与沙箱限制）';
+      if (mode === 'plan') return 'Plan（只读沙箱，不能直接改文件）';
+      return '默认（Codex full-auto，可直接执行并修改文件）';
+    }
+    if (mode === 'yolo' && isRootOrSudo) return 'YOLO（当前环境会自动降级为默认模式）';
+    if (mode === 'yolo') return 'YOLO（跳过所有权限检查）';
+    if (mode === 'plan') return 'Plan（执行前需确认计划）';
+    return '默认（标准权限审批）';
+  }
 
   const THEME_OPTIONS = [
     {
@@ -70,12 +99,14 @@
   // --- State ---
   let ws = null;
   let authToken = localStorage.getItem('cc-web-token');
+  let isAuthenticated = false;
   let currentSessionId = null;
   let sessions = [];
   let sessionCache = new Map();
   let isGenerating = false;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
+  let pendingLoginPassword = '';
   let pendingText = '';
   let renderTimer = null;
   let activeToolCalls = new Map();
@@ -93,10 +124,30 @@
   let pendingAttachments = [];
   let uploadingAttachments = [];
   let loginPasswordValue = ''; // store login password for force-change flow
+  let isRootOrSudo = false;
   let currentCwd = null;
+  let fileBrowserPath = null;
+  let sidebarToolsHeightPx = 0;
+  let fileBrowserContextMenu = null;
+  let fileBrowserMenuDocClickHandler = null;
+  let fileBrowserMenuDocContextHandler = null;
+  let activeToolTab = 'files';
+  let commandHistory = [];
+  let commandCwdOverride = '';
+  let commandExecState = createEmptyCommandExecState();
+  let commandExecSyncPromise = null;
+  let lastCommandExecSyncAt = 0;
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
+  let securityStatusCache = null;
+  let fileBrowserRefreshSeq = 0;
+  let deferredRuntimeMessages = [];
+  let deferredRuntimeSessionId = null;
+  let replayingDeferredRuntimeMessages = false;
+  let historyChunkQueue = [];
+  let historyChunkFrame = 0;
+  let historyChunkSessionId = null;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -118,6 +169,12 @@
   const newChatDropdown = $('#new-chat-dropdown');
   const importSessionBtn = $('#import-session-btn');
   const sessionList = $('#session-list');
+  const sidebarToolsHeightResizer = $('#sidebar-tools-height-resizer');
+  const sidebarTools = $('#sidebar-tools');
+  const toolTabFiles = $('#tool-tab-files');
+  const toolTabCmd = $('#tool-tab-cmd');
+  const fileBrowserPanel = $('#file-browser-panel');
+  const cmdPanel = $('#cmd-panel');
   const chatTitle = $('#chat-title');
   const chatAgentBtn = $('#chat-agent-btn');
   const chatAgentMenu = $('#chat-agent-menu');
@@ -190,6 +247,16 @@
         `).join('')}
       </div>
     `;
+  }
+
+  function syncModePickerText() {
+    const hint = currentModeDescription(currentMode);
+    const modeLabel = document.querySelector('#mode-select');
+    if (modeLabel) modeLabel.title = hint;
+    const currentModeTag = document.querySelector('.chat-runtime-state');
+    if (currentModeTag && currentModeTag.textContent.includes('运行中')) {
+      currentModeTag.title = hint;
+    }
   }
 
   function mountThemePicker(panel) {
@@ -593,6 +660,148 @@
     };
   }
 
+  let _onSecurityStatus = null;
+  let _onSecurityActionResult = null;
+
+  function openSecuritySubpage() {
+    send({ type: 'get_security_status' });
+
+    const overlay = document.createElement('div');
+    overlay.className = 'settings-overlay settings-subpage-overlay';
+    overlay.style.zIndex = '10001';
+
+    const panel = document.createElement('div');
+    panel.className = 'settings-panel settings-subpage-panel';
+    panel.innerHTML = `
+      <div class="settings-header settings-subpage-header">
+        <button class="settings-back" type="button" aria-label="返回">‹</button>
+        <div class="settings-subpage-copy">
+          <div class="settings-subpage-kicker">Security</div>
+          <h3>安全与访问</h3>
+        </div>
+      </div>
+      <div class="settings-inline-note">
+        连续输错密码 3 次后，该 IP 会被封禁 7 天。这里可以查看当前封禁列表并手动解封。
+      </div>
+      <div id="security-summary" class="settings-inline-note" style="margin-top:10px"></div>
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">当前状态</div>
+      <div id="security-current-status"></div>
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">被禁 IP 列表</div>
+      <div id="security-ban-list"></div>
+      <div class="settings-actions">
+        <button class="btn-test" id="security-refresh-btn">刷新</button>
+        <button class="btn-test" id="security-clear-btn">清空全部封禁</button>
+      </div>
+      <div class="settings-status" id="security-status"></div>
+    `;
+
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+
+    const summaryDiv = panel.querySelector('#security-summary');
+    const currentStatusDiv = panel.querySelector('#security-current-status');
+    const banListDiv = panel.querySelector('#security-ban-list');
+    const statusDiv = panel.querySelector('#security-status');
+    const refreshBtn = panel.querySelector('#security-refresh-btn');
+    const clearBtn = panel.querySelector('#security-clear-btn');
+
+    const savedOnSecurityStatus = _onSecurityStatus;
+    const savedOnSecurityActionResult = _onSecurityActionResult;
+
+    function showStatus(message, type) {
+      statusDiv.textContent = message || '';
+      statusDiv.className = `settings-status ${type || ''}`.trim();
+    }
+
+    function renderCurrentStatus(data) {
+      const currentIp = escapeHtml(data?.currentIp || '未知');
+      const currentBan = data?.currentBan;
+      const lines = [
+        `<div class="settings-inline-note">当前访问 IP：<code>${currentIp}</code></div>`,
+        `<div class="settings-inline-note">封禁规则：${data?.failMax || 3} 次失败 / ${formatDuration(data?.failWindowMs || 0)} 窗口，封禁 ${formatDuration(data?.banDurationMs || 0)}</div>`,
+      ];
+      if (currentBan?.permanent) {
+        lines.push('<div class="settings-inline-note" style="color:var(--text-error, #e85d5d)">当前 IP 已被永久封禁</div>');
+      } else if (currentBan) {
+        lines.push(`<div class="settings-inline-note" style="color:var(--text-error, #e85d5d)">当前 IP 已被封禁，剩余 ${formatDuration(currentBan.remainingMs)}，预计于 ${formatDateTime(currentBan.expiresAtIso)} 自动解封</div>`);
+      } else {
+        lines.push('<div class="settings-inline-note" style="color:var(--success)">当前 IP 未被封禁</div>');
+      }
+      currentStatusDiv.innerHTML = lines.join('');
+    }
+
+    function renderBanList(data) {
+      const list = Array.isArray(data?.bannedIPs) ? data.bannedIPs : [];
+      if (!list.length) {
+        banListDiv.innerHTML = '<div class="settings-inline-note">当前没有被封禁的 IP</div>';
+        return;
+      }
+      banListDiv.innerHTML = list.map((item) => `
+        <div class="settings-field" style="padding:10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div>
+              <div><strong><code>${escapeHtml(item.ip || '')}</code></strong></div>
+              <div class="settings-inline-note">剩余：${item.permanent ? '永久' : formatDuration(item.remainingMs)}</div>
+              <div class="settings-inline-note">解封时间：${item.permanent ? '永久封禁' : formatDateTime(item.expiresAtIso)}</div>
+            </div>
+            <button class="btn-test" data-unban-ip="${escapeHtml(item.ip || '')}" style="padding:4px 12px;white-space:nowrap">解封</button>
+          </div>
+        </div>
+      `).join('');
+      banListDiv.querySelectorAll('[data-unban-ip]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const ip = button.getAttribute('data-unban-ip') || '';
+          if (!ip) return;
+          button.disabled = true;
+          showStatus(`正在解封 ${ip} ...`, '');
+          send({ type: 'unban_ip', ip });
+        });
+      });
+    }
+
+    function renderSecurityStatus(data) {
+      securityStatusCache = data || null;
+      const count = Array.isArray(data?.bannedIPs) ? data.bannedIPs.length : 0;
+      summaryDiv.textContent = count ? `当前共有 ${count} 个 IP 在封禁列表中。` : '当前封禁列表为空。';
+      renderCurrentStatus(data || {});
+      renderBanList(data || {});
+    }
+
+    _onSecurityStatus = (data) => {
+      renderSecurityStatus(data);
+      if (savedOnSecurityStatus) savedOnSecurityStatus(data);
+    };
+
+    _onSecurityActionResult = (msg) => {
+      showStatus(msg.message, msg.success ? 'success' : 'error');
+      if (savedOnSecurityActionResult) savedOnSecurityActionResult(msg);
+    };
+
+    refreshBtn.addEventListener('click', () => {
+      showStatus('正在刷新...', '');
+      send({ type: 'get_security_status' });
+    });
+
+    clearBtn.addEventListener('click', () => {
+      if (!confirm('确认清空全部封禁记录？')) return;
+      showStatus('正在清空封禁列表...', '');
+      send({ type: 'clear_banned_ips' });
+    });
+
+    const closeSubpage = () => {
+      _onSecurityStatus = savedOnSecurityStatus;
+      _onSecurityActionResult = savedOnSecurityActionResult;
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    };
+
+    panel.querySelector('.settings-back').addEventListener('click', closeSubpage);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeSubpage(); });
+
+    if (securityStatusCache) renderSecurityStatus(securityStatusCache);
+  }
+
   function openThemeSubpage() {
     const overlay = document.createElement('div');
     overlay.className = 'settings-overlay settings-subpage-overlay';
@@ -875,13 +1084,14 @@
 
   function ensureAuthenticatedWs() {
     return new Promise((resolve, reject) => {
-      if (ws && ws.readyState === 1 && authToken) {
+      if (ws && ws.readyState === 1 && authToken && isAuthenticated) {
         resolve(authToken);
         return;
       }
-      const savedPassword = localStorage.getItem('cc-web-pw');
-      if (!savedPassword) {
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+      const tokenForRestore = authToken || localStorage.getItem('cc-web-token') || '';
+      const passwordForRestore = loginPasswordValue || pendingLoginPassword || localStorage.getItem('cc-web-pw') || '';
+      if (!tokenForRestore && !passwordForRestore) {
+        reject(new Error('登录状态已失效，请刷新页面后重新登录。'));
         return;
       }
       const timeout = setTimeout(() => {
@@ -899,17 +1109,762 @@
       };
       const onFailed = () => {
         cleanup();
-        reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
+        reject(new Error('登录状态已失效，请刷新页面后重新登录。'));
       };
       document.addEventListener('cc-web-auth-restored', onRestored);
       document.addEventListener('cc-web-auth-failed', onFailed);
 
       if (!ws || ws.readyState > 1) {
+        if (passwordForRestore) pendingLoginPassword = passwordForRestore;
         connect();
+      } else if (ws.readyState === 0) {
+        if (passwordForRestore) pendingLoginPassword = passwordForRestore;
       } else if (ws.readyState === 1) {
-        send({ type: 'auth', password: savedPassword });
+        if (tokenForRestore) {
+          send({ type: 'auth', token: tokenForRestore });
+        } else if (passwordForRestore) {
+          send({ type: 'auth', password: passwordForRestore });
+        }
       }
     });
+  }
+
+  function formatBytes(bytes) {
+    const size = Number(bytes) || 0;
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function formatDuration(ms) {
+    const value = Number(ms);
+    if (!Number.isFinite(value)) return '-';
+    if (value <= 0) return '已到期';
+    const totalMinutes = Math.ceil(value / 60000);
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+    const parts = [];
+    if (days) parts.push(`${days}天`);
+    if (hours) parts.push(`${hours}小时`);
+    if (minutes && parts.length < 2) parts.push(`${minutes}分钟`);
+    if (!parts.length) parts.push('不足1分钟');
+    return parts.join('');
+  }
+
+  function formatDateTime(dateStr) {
+    if (!dateStr) return '-';
+    const d = new Date(dateStr);
+    if (Number.isNaN(d.getTime())) return '-';
+    return d.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  async function apiFetch(path, options = {}) {
+    await ensureAuthenticatedWs();
+    const headers = { ...(options.headers || {}), Authorization: `Bearer ${authToken}` };
+    const response = await fetch(path, { ...options, headers });
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message || `请求失败 (${response.status})`);
+    }
+    return payload;
+  }
+
+  async function downloadFileWithAuth(targetPath) {
+    await ensureAuthenticatedWs();
+    const response = await fetch(`/api/fs/download?path=${encodeURIComponent(targetPath)}`, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!response.ok) throw new Error(`下载失败 (${response.status})`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = targetPath.split('/').pop() || 'download';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  const COMMAND_HISTORY_KEY = 'cc-web-cmd-history';
+  const SIDEBAR_TOOLS_HEIGHT_KEY = 'cc-web-sidebar-tools-height';
+  const MAX_COMMAND_HISTORY = 30;
+
+  function normalizeCommandHistory(list) {
+    const deduped = [];
+    for (const item of Array.isArray(list) ? list : []) {
+      const cmd = String(item || '').trim();
+      if (!cmd || deduped.includes(cmd)) continue;
+      deduped.push(cmd);
+      if (deduped.length >= MAX_COMMAND_HISTORY) break;
+    }
+    return deduped;
+  }
+
+  function loadCommandHistory() {
+    try {
+      const raw = localStorage.getItem(COMMAND_HISTORY_KEY);
+      commandHistory = normalizeCommandHistory(raw ? JSON.parse(raw) : []);
+    } catch {
+      commandHistory = [];
+    }
+  }
+
+  async function loadCommandHistoryFromServer() {
+    const payload = await apiFetch('/api/exec/history');
+    const remoteHistory = normalizeCommandHistory(payload?.history || []);
+    if (!remoteHistory.length) {
+      if (commandHistory.length) {
+        await saveCommandHistoryToServer();
+      }
+      return;
+    }
+    commandHistory = remoteHistory;
+    saveCommandHistory();
+    renderCmdPanel();
+  }
+
+  async function saveCommandHistoryToServer() {
+    await apiFetch('/api/exec/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ history: commandHistory }),
+    });
+  }
+
+  async function syncRunningCommandFromServer(options = {}) {
+    if (!authToken) return;
+    const force = !!options.force;
+    const now = Date.now();
+    if (!force && commandExecSyncPromise) return commandExecSyncPromise;
+    if (!force && now - lastCommandExecSyncAt < 1200) return commandExecSyncPromise || Promise.resolve();
+    lastCommandExecSyncAt = now;
+    commandExecSyncPromise = (async () => {
+      try {
+        const payload = await apiFetch('/api/exec/current');
+        if (!payload?.running) {
+          if (commandExecState.running) {
+            commandExecState.running = false;
+            commandExecState.stopInProgress = false;
+            syncCommandPanelUi();
+          }
+          return;
+        }
+        commandExecState = {
+          ...commandExecState,
+          execId: payload.execId || commandExecState.execId,
+          command: payload.command || commandExecState.command,
+          cwd: payload.cwd || commandExecState.cwd,
+          stdout: typeof payload.stdout === 'string' ? payload.stdout : commandExecState.stdout,
+          stderr: typeof payload.stderr === 'string' ? payload.stderr : commandExecState.stderr,
+          running: true,
+          stopInProgress: !!payload.stopInProgress,
+          startedAt: payload.startedAt || commandExecState.startedAt,
+          error: '',
+        };
+        syncCommandPanelUi();
+      } catch {}
+      finally {
+        commandExecSyncPromise = null;
+      }
+    })();
+    return commandExecSyncPromise;
+  }
+
+  function createEmptyCommandExecState() {
+    return {
+      execId: '',
+      command: '',
+      cwd: '',
+      stdout: '',
+      stderr: '',
+      running: false,
+      stopInProgress: false,
+      exitCode: null,
+      timedOut: false,
+      signal: '',
+      error: '',
+      startedAt: '',
+      finishedAt: '',
+    };
+  }
+
+  function buildCommandExecOutput() {
+    if (!commandExecState.command) return '等待执行命令...';
+    const parts = [`> ${commandExecState.command}`];
+    if (commandExecState.cwd) parts.push(`[cwd] ${commandExecState.cwd}`);
+    if (commandExecState.running) {
+      parts.push(`[status] ${commandExecState.stopInProgress ? '正在停止...' : '执行中...'}`);
+    } else if (commandExecState.error) {
+      parts.push(`[error] ${commandExecState.error}`);
+    } else if (typeof commandExecState.exitCode === 'number') {
+      let exitLine = `[exit] ${commandExecState.exitCode}`;
+      if (commandExecState.timedOut) exitLine += ' (timeout)';
+      if (commandExecState.signal) exitLine += ` [signal ${commandExecState.signal}]`;
+      parts.push(exitLine);
+    }
+    if (commandExecState.stdout) parts.push(`\n[stdout]\n${commandExecState.stdout}`);
+    if (commandExecState.stderr) parts.push(`\n[stderr]\n${commandExecState.stderr}`);
+    if (!commandExecState.stdout && !commandExecState.stderr && commandExecState.running) {
+      parts.push('执行中...');
+    }
+    return parts.filter(Boolean).join('\n');
+  }
+
+  function syncCommandPanelUi() {
+    if (!cmdPanel) return;
+    const output = cmdPanel.querySelector('#cmd-output-box');
+    const runBtn = cmdPanel.querySelector('#cmd-run-btn');
+    const stopBtn = cmdPanel.querySelector('#cmd-stop-btn');
+    if (output) output.textContent = buildCommandExecOutput();
+    if (runBtn) runBtn.disabled = !!commandExecState.running;
+    if (stopBtn) {
+      stopBtn.hidden = !commandExecState.running;
+      stopBtn.disabled = !commandExecState.running || !!commandExecState.stopInProgress;
+    }
+  }
+
+  function appendCommandExecNote(text) {
+    const output = cmdPanel?.querySelector('#cmd-output-box');
+    if (!output) return;
+    output.textContent = `${output.textContent}\n\n[system] ${text}`;
+  }
+
+  function handleExecStreamMessage(msg) {
+    const event = String(msg?.event || '').trim();
+    const execId = String(msg?.execId || '').trim();
+    const sameExec = !commandExecState.execId || commandExecState.execId === execId || commandExecState.execId === 'pending';
+    if (!event) return;
+
+    switch (event) {
+      case 'start':
+        commandExecState = {
+          ...createEmptyCommandExecState(),
+          execId: execId || commandExecState.execId || 'pending',
+          command: msg.command || commandExecState.command,
+          cwd: msg.cwd || commandExecState.cwd,
+          running: true,
+          startedAt: msg.startedAt || '',
+        };
+        break;
+
+      case 'stdout':
+      case 'stderr':
+        if (!sameExec) return;
+        if (!commandExecState.execId || commandExecState.execId === 'pending') commandExecState.execId = execId;
+        commandExecState.running = true;
+        if (msg.cwd && !commandExecState.cwd) commandExecState.cwd = msg.cwd;
+        commandExecState[event] += String(msg.text || '');
+        break;
+
+      case 'stop_requested':
+        if (commandExecState.execId && execId && commandExecState.execId !== execId) return;
+        commandExecState.stopInProgress = true;
+        break;
+
+      case 'end':
+        if (!sameExec) return;
+        if (!commandExecState.execId || commandExecState.execId === 'pending') commandExecState.execId = execId;
+        commandExecState.running = false;
+        commandExecState.stopInProgress = false;
+        commandExecState.cwd = msg.cwd || commandExecState.cwd;
+        commandExecState.exitCode = typeof msg.code === 'number' ? msg.code : commandExecState.exitCode;
+        commandExecState.timedOut = !!msg.timedOut;
+        commandExecState.signal = msg.signal || '';
+        commandExecState.finishedAt = msg.finishedAt || '';
+        break;
+
+      case 'error':
+        if (!sameExec) return;
+        commandExecState.running = false;
+        commandExecState.stopInProgress = false;
+        commandExecState.cwd = msg.cwd || commandExecState.cwd;
+        commandExecState.error = msg.message || '执行失败';
+        break;
+
+      default:
+        return;
+    }
+
+    syncCommandPanelUi();
+  }
+
+  function saveCommandHistory() {
+    try {
+      localStorage.setItem(COMMAND_HISTORY_KEY, JSON.stringify(commandHistory.slice(0, MAX_COMMAND_HISTORY)));
+    } catch {}
+  }
+
+  function pushCommandHistory(command) {
+    const cmd = String(command || '').trim();
+    if (!cmd) return;
+    commandHistory = [cmd, ...commandHistory.filter((item) => item !== cmd)].slice(0, MAX_COMMAND_HISTORY);
+    saveCommandHistory();
+    saveCommandHistoryToServer().catch(() => {});
+  }
+
+  function getSidebarToolsHeightBounds() {
+    const sidebarHeight = Math.max(1, sidebar?.clientHeight || window.innerHeight || 1);
+    const min = 180;
+    const max = Math.max(min + 40, Math.floor(sidebarHeight * 0.72));
+    return { min, max };
+  }
+
+  function loadSidebarToolsHeight() {
+    const raw = Number(localStorage.getItem(SIDEBAR_TOOLS_HEIGHT_KEY));
+    if (Number.isFinite(raw) && raw > 0) {
+      sidebarToolsHeightPx = raw;
+      return;
+    }
+    const sidebarHeight = sidebar?.clientHeight || window.innerHeight || 800;
+    sidebarToolsHeightPx = Math.floor(sidebarHeight * 0.42);
+  }
+
+  function applySidebarToolsHeight(nextHeight, options = {}) {
+    if (!sidebarTools) return;
+    const { min, max } = getSidebarToolsHeightBounds();
+    const height = Math.max(min, Math.min(max, Number(nextHeight) || sidebarToolsHeightPx || min));
+    sidebarToolsHeightPx = height;
+    sidebarTools.style.height = `${height}px`;
+    if (!options.skipPersist) {
+      try { localStorage.setItem(SIDEBAR_TOOLS_HEIGHT_KEY, String(height)); } catch {}
+    }
+  }
+
+  function bindSidebarToolsHeightResizer() {
+    if (!sidebarTools || !sidebarToolsHeightResizer) return;
+    let dragging = false;
+    let pointerId = null;
+    let startY = 0;
+    let startHeight = 0;
+
+    const stopDragging = (e) => {
+      if (!dragging || pointerId !== e.pointerId) return;
+      dragging = false;
+      pointerId = null;
+      document.body.style.userSelect = '';
+      try { sidebarToolsHeightResizer.releasePointerCapture(e.pointerId); } catch {}
+    };
+
+    sidebarToolsHeightResizer.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      dragging = true;
+      pointerId = e.pointerId;
+      startY = e.clientY;
+      startHeight = sidebarTools.offsetHeight || sidebarToolsHeightPx || 240;
+      document.body.style.userSelect = 'none';
+      try { sidebarToolsHeightResizer.setPointerCapture(e.pointerId); } catch {}
+    });
+
+    sidebarToolsHeightResizer.addEventListener('pointermove', (e) => {
+      if (!dragging || pointerId !== e.pointerId) return;
+      const deltaY = e.clientY - startY;
+      applySidebarToolsHeight(startHeight - deltaY);
+    });
+
+    sidebarToolsHeightResizer.addEventListener('pointerup', stopDragging);
+    sidebarToolsHeightResizer.addEventListener('pointercancel', stopDragging);
+  }
+
+  function switchToolTab(tab) {
+    activeToolTab = tab === 'cmd' ? 'cmd' : 'files';
+    if (toolTabFiles) toolTabFiles.classList.toggle('active', activeToolTab === 'files');
+    if (toolTabCmd) toolTabCmd.classList.toggle('active', activeToolTab === 'cmd');
+    if (fileBrowserPanel) fileBrowserPanel.hidden = activeToolTab !== 'files';
+    if (cmdPanel) cmdPanel.hidden = activeToolTab !== 'cmd';
+  }
+
+  function renderCmdPanel() {
+    if (!cmdPanel) return;
+    if (isAuthenticated && authToken) syncRunningCommandFromServer().catch(() => {});
+    const defaultCwd = currentCwd || fileBrowserPath || '';
+    const cwdValue = commandCwdOverride || defaultCwd;
+    const inputValue = commandExecState.running ? commandExecState.command : '';
+    cmdPanel.innerHTML = `
+      <div class="cmd-head">执行目录（可修改）</div>
+      <input id="cmd-cwd-input" class="cmd-input" type="text" placeholder="默认当前会话目录" value="${escapeAttr(cwdValue)}" />
+      <div class="cmd-row">
+        <input id="cmd-input-box" class="cmd-input" type="text" placeholder="输入命令，如 ls -la" value="${escapeAttr(inputValue)}" />
+        <button id="cmd-run-btn" class="cmd-run-btn" type="button">执行</button>
+        <button id="cmd-stop-btn" class="cmd-run-btn cmd-stop-btn" type="button" hidden>停止</button>
+      </div>
+      <div class="cmd-row">
+        <select id="cmd-history-select" class="cmd-history">
+          <option value="">历史命令（选择后自动填充）</option>
+          ${commandHistory.map((cmd) => `<option value="${escapeAttr(cmd)}">${escapeHtml(cmd)}</option>`).join('')}
+        </select>
+        <button id="cmd-history-del-btn" class="cmd-run-btn" type="button">删除记录</button>
+      </div>
+      <pre id="cmd-output-box" class="cmd-output">${escapeHtml(buildCommandExecOutput())}</pre>
+    `;
+
+    const cwdInput = cmdPanel.querySelector('#cmd-cwd-input');
+    const input = cmdPanel.querySelector('#cmd-input-box');
+    const historySelect = cmdPanel.querySelector('#cmd-history-select');
+    const historyDelBtn = cmdPanel.querySelector('#cmd-history-del-btn');
+    const runBtn = cmdPanel.querySelector('#cmd-run-btn');
+
+    async function stopRunningCommand() {
+      if (!commandExecState.running || commandExecState.stopInProgress) return;
+      commandExecState.stopInProgress = true;
+      syncCommandPanelUi();
+      try {
+        const res = await apiFetch('/api/exec/stop', { method: 'POST' });
+        if (res?.message) appendCommandExecNote(res.message);
+      } catch (err) {
+        commandExecState.stopInProgress = false;
+        syncCommandPanelUi();
+        appendCommandExecNote(`停止失败: ${err.message || 'unknown error'}`);
+      }
+    }
+
+    async function runCommand(command) {
+      const cmd = String(command || '').trim();
+      if (!cmd) return;
+      if (commandExecState.running) {
+        appendCommandExecNote('命令仍在执行，请先点击“停止”');
+        return;
+      }
+      const runCwd = (cwdInput.value || '').trim() || defaultCwd || '';
+      commandCwdOverride = (cwdInput.value || '').trim();
+      commandExecState = {
+        ...createEmptyCommandExecState(),
+        execId: 'pending',
+        command: cmd,
+        cwd: runCwd,
+        running: true,
+        startedAt: new Date().toISOString(),
+      };
+      syncCommandPanelUi();
+      try {
+        const result = await apiFetch('/api/exec/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: cmd, cwd: runCwd }),
+        });
+        pushCommandHistory(cmd);
+        commandExecState = {
+          ...commandExecState,
+          execId: result.execId || commandExecState.execId,
+          command: cmd,
+          cwd: result.cwd || commandExecState.cwd,
+          stdout: typeof result.stdout === 'string' ? result.stdout : commandExecState.stdout,
+          stderr: typeof result.stderr === 'string' ? result.stderr : commandExecState.stderr,
+          running: false,
+          stopInProgress: false,
+          exitCode: typeof result.code === 'number' ? result.code : commandExecState.exitCode,
+          timedOut: !!result.timedOut,
+          signal: result.signal || '',
+          error: '',
+        };
+        syncCommandPanelUi();
+        const exists = Array.from(historySelect.options).some((option) => option.value === cmd);
+        if (!exists) {
+          const opt = document.createElement('option');
+          opt.value = cmd;
+          opt.textContent = cmd;
+          historySelect.insertBefore(opt, historySelect.children[1] || null);
+        }
+      } catch (err) {
+        commandExecState = {
+          ...commandExecState,
+          running: false,
+          stopInProgress: false,
+          error: err.message || 'unknown error',
+        };
+        syncCommandPanelUi();
+      }
+    }
+
+    runBtn.addEventListener('click', () => runCommand(input.value));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        runCommand(input.value);
+      }
+    });
+    historySelect.addEventListener('change', () => {
+      const cmd = historySelect.value;
+      if (!cmd) return;
+      input.value = cmd;
+      input.focus();
+    });
+    historyDelBtn.addEventListener('click', () => {
+      const cmd = historySelect.value;
+      if (!cmd) return;
+      commandHistory = commandHistory.filter((item) => item !== cmd);
+      saveCommandHistory();
+      saveCommandHistoryToServer().catch(() => {});
+      renderCmdPanel();
+    });
+    cwdInput.addEventListener('input', () => {
+      commandCwdOverride = cwdInput.value.trim();
+    });
+    const stopBtn = cmdPanel.querySelector('#cmd-stop-btn');
+    if (stopBtn) stopBtn.addEventListener('click', stopRunningCommand);
+    syncCommandPanelUi();
+  }
+
+  function escapeAttr(value) {
+    return escapeHtml(String(value || '')).replace(/"/g, '&quot;');
+  }
+
+  function renderFileBrowserShell() {
+    if (!fileBrowserPanel) return;
+    fileBrowserPanel.innerHTML = `
+      <div class="file-browser-head">
+        <div class="file-browser-title" id="file-browser-title">文件浏览</div>
+        <div class="file-browser-actions">
+          <button class="file-browser-btn" id="file-browser-up" title="上一级">↑</button>
+          <button class="file-browser-btn" id="file-browser-refresh" title="刷新">↻</button>
+        </div>
+      </div>
+      <div class="file-browser-list" id="file-browser-list"></div>
+      <div class="file-browser-status" id="file-browser-status"></div>
+    `;
+  }
+
+  async function openFileEditor(targetPath) {
+    const file = await apiFetch(`/api/fs/read?path=${encodeURIComponent(targetPath)}`);
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-panel modal-panel-wide">
+        <div class="modal-header">
+          <span class="modal-title">编辑文件</span>
+          <button class="modal-close-btn" type="button">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="import-item-meta">${escapeHtml(file.path)}</div>
+          <textarea id="file-editor-text" style="width:100%;min-height:360px;resize:vertical;border:1px solid var(--border-color);border-radius:10px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;">${escapeHtml(file.content || '')}</textarea>
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px;">
+            <button class="btn-test" id="file-editor-download" type="button">下载</button>
+            <button class="btn-save" id="file-editor-save" type="button">保存</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector('.modal-close-btn').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('#file-editor-download').addEventListener('click', () => {
+      downloadFileWithAuth(targetPath).catch((err) => alert(err.message || '下载失败'));
+    });
+    overlay.querySelector('#file-editor-save').addEventListener('click', async () => {
+      const text = overlay.querySelector('#file-editor-text').value;
+      await apiFetch('/api/fs/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: targetPath, content: text }),
+      });
+      close();
+      refreshFileBrowser();
+    });
+  }
+
+  function closeFileBrowserContextMenu() {
+    if (!fileBrowserContextMenu) return;
+    if (fileBrowserMenuDocClickHandler) {
+      document.removeEventListener('click', fileBrowserMenuDocClickHandler);
+      fileBrowserMenuDocClickHandler = null;
+    }
+    if (fileBrowserMenuDocContextHandler) {
+      document.removeEventListener('contextmenu', fileBrowserMenuDocContextHandler);
+      fileBrowserMenuDocContextHandler = null;
+    }
+    fileBrowserContextMenu.remove();
+    fileBrowserContextMenu = null;
+  }
+
+  function openFileBrowserContextMenu(x, y, items) {
+    closeFileBrowserContextMenu();
+    const menu = document.createElement('div');
+    menu.className = 'file-browser-context-menu';
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    menu.innerHTML = items.map((item) => `<button type="button" class="file-browser-context-item" data-key="${escapeAttr(item.key)}">${escapeHtml(item.label)}</button>`).join('');
+    document.body.appendChild(menu);
+    fileBrowserContextMenu = menu;
+    setTimeout(() => {
+      fileBrowserMenuDocClickHandler = (ev) => {
+        if (fileBrowserContextMenu && !fileBrowserContextMenu.contains(ev.target)) closeFileBrowserContextMenu();
+      };
+      fileBrowserMenuDocContextHandler = (ev) => {
+        if (fileBrowserContextMenu && !fileBrowserContextMenu.contains(ev.target)) closeFileBrowserContextMenu();
+      };
+      document.addEventListener('click', fileBrowserMenuDocClickHandler);
+      document.addEventListener('contextmenu', fileBrowserMenuDocContextHandler);
+    }, 0);
+    return menu;
+  }
+
+  async function createFileInCurrentDir() {
+    const name = prompt('输入新文件名');
+    if (!name) return;
+    await apiFetch('/api/fs/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ basePath: fileBrowserPath, name: name.trim(), content: '' }),
+    });
+    refreshFileBrowser(fileBrowserPath);
+  }
+
+  async function createDirInCurrentDir() {
+    const name = prompt('输入新文件夹名');
+    if (!name) return;
+    await apiFetch('/api/fs/mkdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ basePath: fileBrowserPath, name: name.trim() }),
+    });
+    refreshFileBrowser(fileBrowserPath);
+  }
+
+  async function refreshFileBrowser(targetPath = null) {
+    if (!fileBrowserPanel) return;
+    if (!fileBrowserPanel.querySelector('#file-browser-list')) renderFileBrowserShell();
+    const seq = ++fileBrowserRefreshSeq;
+    const title = fileBrowserPanel.querySelector('#file-browser-title');
+    const list = fileBrowserPanel.querySelector('#file-browser-list');
+    const status = fileBrowserPanel.querySelector('#file-browser-status');
+    if (!isAuthenticated) {
+      title.textContent = '文件浏览';
+      list.innerHTML = '';
+      status.textContent = authToken ? '正在恢复登录状态...' : '请先登录后查看文件';
+      return;
+    }
+    const desiredPath = targetPath || fileBrowserPath || currentCwd || '';
+    status.textContent = '加载中...';
+    try {
+      const result = await apiFetch(`/api/fs/list?path=${encodeURIComponent(desiredPath)}`);
+      if (seq !== fileBrowserRefreshSeq) return;
+      fileBrowserPath = result.cwd;
+      title.textContent = `文件: ${result.cwd}`;
+      list.innerHTML = result.entries.map((entry) => {
+        const icon = entry.type === 'dir' ? '📁' : '📄';
+        const meta = entry.type === 'dir' ? '目录' : formatBytes(entry.size);
+        return `
+          <div class="file-browser-item" data-entry-path="${escapeAttr(entry.path)}" data-entry-name="${escapeAttr(entry.name)}" data-entry-type="${entry.type}">
+            <span>${icon}</span>
+            <span class="file-browser-item-name" title="${escapeAttr(entry.path)}">${escapeHtml(entry.name)}</span>
+            <span class="file-browser-item-meta">${meta}</span>
+          </div>
+        `;
+      }).join('') || '<div class="file-browser-item"><span class="file-browser-item-meta">目录为空</span></div>';
+      status.textContent = `${result.entries.length} 项`;
+
+      list.querySelectorAll('[data-entry-path]').forEach((row) => {
+        row.addEventListener('dblclick', async () => {
+          const entryPath = row.dataset.entryPath;
+          const entryType = row.dataset.entryType;
+          try {
+            if (entryType === 'dir') await refreshFileBrowser(entryPath);
+            else await openFileEditor(entryPath);
+          } catch (err) {
+            alert(err.message || '打开失败');
+          }
+        });
+        row.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          const entryPath = row.dataset.entryPath;
+          const entryName = row.dataset.entryName || '';
+          const entryType = row.dataset.entryType;
+          const menu = openFileBrowserContextMenu(e.clientX, e.clientY, [
+            { key: 'open', label: entryType === 'dir' ? '进入目录' : '查看/编辑' },
+            ...(entryType === 'file' ? [{ key: 'download', label: '下载' }] : []),
+            { key: 'rename', label: '重命名' },
+            { key: 'delete', label: '删除' },
+            { key: 'new_file', label: '新建文件' },
+            { key: 'new_dir', label: '新建文件夹' },
+            { key: 'refresh', label: '刷新' },
+          ]);
+          menu.querySelectorAll('[data-key]').forEach((btn) => {
+            btn.addEventListener('click', async () => {
+              closeFileBrowserContextMenu();
+              try {
+                const key = btn.dataset.key;
+                if (key === 'open') {
+                  if (entryType === 'dir') await refreshFileBrowser(entryPath);
+                  else await openFileEditor(entryPath);
+                } else if (key === 'download' && entryType === 'file') {
+                  await downloadFileWithAuth(entryPath);
+                } else if (key === 'rename') {
+                  const newName = prompt('输入新名称', entryName);
+                  if (!newName || newName === entryName) return;
+                  await apiFetch('/api/fs/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: entryPath, newName: newName.trim() }),
+                  });
+                  refreshFileBrowser(fileBrowserPath);
+                } else if (key === 'delete') {
+                  const label = entryType === 'dir' ? '目录' : '文件';
+                  if (!confirm(`确认删除该${label}？`)) return;
+                  await apiFetch('/api/fs/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: entryPath }),
+                  });
+                  refreshFileBrowser(fileBrowserPath);
+                } else if (key === 'new_file') {
+                  await createFileInCurrentDir();
+                } else if (key === 'new_dir') {
+                  await createDirInCurrentDir();
+                } else if (key === 'refresh') {
+                  refreshFileBrowser(fileBrowserPath);
+                }
+              } catch (err) {
+                alert(err.message || '操作失败');
+              }
+            });
+          });
+        });
+        let touchTimer = null;
+        row.addEventListener('touchstart', (e) => {
+          const touch = e.touches && e.touches[0];
+          if (!touch) return;
+          touchTimer = setTimeout(() => {
+            row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: touch.clientX, clientY: touch.clientY }));
+          }, 520);
+        }, { passive: true });
+        row.addEventListener('touchend', () => { if (touchTimer) clearTimeout(touchTimer); touchTimer = null; }, { passive: true });
+        row.addEventListener('touchmove', () => { if (touchTimer) clearTimeout(touchTimer); touchTimer = null; }, { passive: true });
+      });
+      list.oncontextmenu = (e) => {
+        if (e.target.closest('[data-entry-path]')) return;
+        e.preventDefault();
+        const menu = openFileBrowserContextMenu(e.clientX, e.clientY, [
+          { key: 'new_file', label: '新建文件' },
+          { key: 'new_dir', label: '新建文件夹' },
+          { key: 'refresh', label: '刷新' },
+        ]);
+        menu.querySelectorAll('[data-key]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            closeFileBrowserContextMenu();
+            try {
+              if (btn.dataset.key === 'new_file') await createFileInCurrentDir();
+              if (btn.dataset.key === 'new_dir') await createDirInCurrentDir();
+              if (btn.dataset.key === 'refresh') refreshFileBrowser(fileBrowserPath);
+            } catch (err) {
+              alert(err.message || '操作失败');
+            }
+          });
+        });
+      };
+
+      const upBtn = fileBrowserPanel.querySelector('#file-browser-up');
+      const refreshBtn = fileBrowserPanel.querySelector('#file-browser-refresh');
+      upBtn.disabled = !result.parent;
+      upBtn.onclick = () => result.parent && refreshFileBrowser(result.parent);
+      refreshBtn.onclick = () => refreshFileBrowser(fileBrowserPath);
+    } catch (err) {
+      if (seq !== fileBrowserRefreshSeq) return;
+      list.innerHTML = '';
+      status.textContent = err.message || '读取目录失败';
+    }
   }
 
   function renderAttachmentLabels(attachments, options = {}) {
@@ -1113,16 +2068,21 @@
     clearSessionLoading();
     setCurrentSessionRunningState(false);
     currentCwd = null;
+    renderCmdPanel();
+    fileBrowserPath = null;
     currentModel = currentAgent === 'claude' ? 'opus' : '';
     isGenerating = false;
     pendingText = '';
     pendingAttachments = [];
     uploadingAttachments = [];
     activeToolCalls.clear();
+    clearDeferredRuntimeMessages();
+    clearHistoryChunkQueue();
     sendBtn.hidden = false;
     abortBtn.hidden = true;
     chatTitle.textContent = '新会话';
     updateCwdBadge();
+    refreshFileBrowser().catch(() => {});
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
     setStatsDisplay(null);
     renderPendingAttachments();
@@ -1132,6 +2092,8 @@
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
     const preserveStreaming = !!(options.preserveStreaming && isGenerating && snapshot.sessionId === currentSessionId && snapshot.isRunning);
+    const preserveScroll = !!options.preserveScroll && snapshot.sessionId === currentSessionId;
+    const previousScrollTop = messagesDiv.scrollTop;
     if (isGenerating && !preserveStreaming) {
       isGenerating = false;
       sendBtn.hidden = false;
@@ -1147,7 +2109,10 @@
     setCurrentSessionRunningState(snapshot.isRunning);
     setStatsDisplay(snapshot);
     currentCwd = snapshot.cwd || null;
+    renderCmdPanel();
+    if (currentCwd && currentCwd !== fileBrowserPath) fileBrowserPath = currentCwd;
     updateCwdBadge();
+    refreshFileBrowser(fileBrowserPath || currentCwd || '').catch(() => {});
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
       currentMode = snapshot.mode;
       modeSelect.value = currentMode;
@@ -1155,7 +2120,7 @@
     }
     currentModel = snapshot.model || '';
     if (!preserveStreaming) {
-      renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
+      renderMessages(snapshot.messages || [], { immediate: !!options.immediate, preserveScroll, previousScrollTop });
     }
     highlightActiveSession();
     renderSessionList();
@@ -1200,7 +2165,7 @@
   function setSessionLoading(sessionId, options = {}) {
     const loading = !!sessionId;
     const blocking = options.blocking !== false;
-    activeSessionLoad = loading ? { sessionId, blocking, snapshot: null } : null;
+    activeSessionLoad = loading ? { sessionId, blocking, preserveScroll: options.preserveScroll === true, snapshot: null } : null;
     const showOverlay = !!(loading && blocking);
     document.body.classList.toggle('session-loading-active', showOverlay);
     sessionLoadingOverlay.hidden = !showOverlay;
@@ -1217,7 +2182,14 @@
 
   function clearSessionLoading(sessionId) {
     if (sessionId && activeSessionLoad && activeSessionLoad.sessionId !== sessionId) return;
+    const closingSessionId = activeSessionLoad?.sessionId || null;
     setSessionLoading(null, { blocking: false });
+    if (closingSessionId && deferredRuntimeSessionId === closingSessionId) {
+      clearDeferredRuntimeMessages();
+    }
+    if (closingSessionId && historyChunkSessionId === closingSessionId) {
+      clearHistoryChunkQueue();
+    }
   }
 
   function isBlockingSessionLoad(sessionId) {
@@ -1228,7 +2200,8 @@
 
   function finishSessionSwitch(sessionId) {
     if (isBlockingSessionLoad(sessionId)) {
-      scrollToBottom();
+      if (activeSessionLoad?.preserveScroll) updateScrollbar();
+      else scrollToBottom();
       requestAnimationFrame(() => clearSessionLoading(sessionId));
       return;
     }
@@ -1240,6 +2213,7 @@
       activeSessionLoad.snapshot.complete = true;
       cacheSessionSnapshot(activeSessionLoad.snapshot);
     }
+    flushDeferredRuntimeMessages(sessionId);
     finishSessionSwitch(sessionId);
   }
 
@@ -1250,8 +2224,10 @@
     if (!force && activeSessionLoad?.sessionId === sessionId) return;
     if (!force && sessionId === currentSessionId && !activeSessionLoad) return;
     renderEpoch++;
-    loadedHistorySessionId = null;
-    setSessionLoading(sessionId, { blocking, label: options.label });
+    clearDeferredRuntimeMessages();
+    clearHistoryChunkQueue();
+    if (!options.preserveScroll) loadedHistorySessionId = null;
+    setSessionLoading(sessionId, { blocking, label: options.label, preserveScroll: options.preserveScroll === true });
     send({ type: 'load_session', sessionId });
   }
 
@@ -1270,7 +2246,7 @@
   function openSession(sessionId, options = {}) {
     if (!sessionId) return;
     if (options.forceSync) {
-      beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
+      beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label, preserveScroll: options.preserveScroll === true });
       return;
     }
     if (!options.force && sessionId === currentSessionId && !activeSessionLoad) return;
@@ -1281,10 +2257,10 @@
       return;
     }
     if (disposition === 'weak' && showCachedSession(sessionId)) {
-      beginSessionSwitch(sessionId, { blocking: false, force: true, label: options.label });
+      beginSessionSwitch(sessionId, { blocking: false, force: true, label: options.label, preserveScroll: options.preserveScroll === true });
       return;
     }
-    beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: options.force === true, label: options.label });
+    beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: options.force === true, label: options.label, preserveScroll: options.preserveScroll === true });
   }
 
   function setStatsDisplay(msg) {
@@ -1448,7 +2424,11 @@
 
     ws.onopen = () => {
       reconnectAttempts = 0;
-      if (authToken) send({ type: 'auth', token: authToken });
+      if (pendingLoginPassword) {
+        send({ type: 'auth', password: pendingLoginPassword });
+      } else if (authToken) {
+        send({ type: 'auth', token: authToken });
+      }
     };
 
     ws.onmessage = (e) => {
@@ -1468,6 +2448,18 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
   }
 
+  function submitLogin(password) {
+    const pw = String(password || '');
+    if (!pw) return;
+    pendingLoginPassword = pw;
+    if (!ws || ws.readyState > 1) {
+      connect();
+      return;
+    }
+    if (ws.readyState === 0) return;
+    send({ type: 'auth', password: pw });
+  }
+
   function scheduleReconnect() {
     if (reconnectTimer) return;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
@@ -1478,12 +2470,126 @@
     }, delay);
   }
 
+  function isRuntimeStreamMessage(type) {
+    return type === 'text_delta' ||
+      type === 'tool_start' ||
+      type === 'tool_end' ||
+      type === 'resume_generating' ||
+      type === 'done';
+  }
+
+  function clearDeferredRuntimeMessages() {
+    deferredRuntimeMessages = [];
+    deferredRuntimeSessionId = null;
+  }
+
+  function clearHistoryChunkQueue() {
+    historyChunkQueue = [];
+    historyChunkSessionId = null;
+    if (historyChunkFrame) {
+      cancelAnimationFrame(historyChunkFrame);
+      historyChunkFrame = 0;
+    }
+  }
+
+  function scheduleHistoryChunkPump() {
+    if (historyChunkFrame) return;
+    historyChunkFrame = requestAnimationFrame(processHistoryChunkQueue);
+  }
+
+  function enqueueHistoryChunk(chunk) {
+    if (!chunk?.sessionId) return;
+    if (!historyChunkSessionId) historyChunkSessionId = chunk.sessionId;
+    if (historyChunkSessionId !== chunk.sessionId) {
+      clearHistoryChunkQueue();
+      historyChunkSessionId = chunk.sessionId;
+    }
+    historyChunkQueue.push(chunk);
+    scheduleHistoryChunkPump();
+  }
+
+  function processHistoryChunkQueue() {
+    historyChunkFrame = 0;
+    if (!historyChunkQueue.length) return;
+
+    const targetSessionId = historyChunkSessionId;
+    if (!targetSessionId || targetSessionId !== currentSessionId || loadedHistorySessionId !== targetSessionId) {
+      clearHistoryChunkQueue();
+      return;
+    }
+
+    const startedAt = performance.now();
+    const frameBudgetMs = isBlockingSessionLoad(targetSessionId) ? 12 : 8;
+    let sawLastChunk = false;
+
+    while (historyChunkQueue.length > 0 && (performance.now() - startedAt) < frameBudgetMs) {
+      const chunk = historyChunkQueue.shift();
+      if (chunk.sessionId !== currentSessionId || loadedHistorySessionId !== chunk.sessionId) {
+        clearHistoryChunkQueue();
+        return;
+      }
+      prependHistoryMessages(chunk.messages || [], {
+        preserveScroll: !chunk.blocking,
+        skipScrollbar: chunk.blocking,
+      });
+      if (!chunk.remaining) sawLastChunk = true;
+    }
+
+    if (historyChunkQueue.length > 0) {
+      scheduleHistoryChunkPump();
+      return;
+    }
+
+    historyChunkSessionId = null;
+    if (sawLastChunk) {
+      finalizeLoadedSession(targetSessionId);
+    }
+  }
+
+  function queueDeferredRuntimeMessage(msg) {
+    const targetSessionId = activeSessionLoad?.sessionId || currentSessionId || null;
+    if (!deferredRuntimeSessionId) deferredRuntimeSessionId = targetSessionId;
+    if (deferredRuntimeSessionId !== targetSessionId) {
+      deferredRuntimeMessages = [];
+      deferredRuntimeSessionId = targetSessionId;
+    }
+    deferredRuntimeMessages.push(msg);
+  }
+
+  function flushDeferredRuntimeMessages(sessionId) {
+    if (!deferredRuntimeMessages.length) return;
+    if (sessionId && deferredRuntimeSessionId && deferredRuntimeSessionId !== sessionId) return;
+    const pending = deferredRuntimeMessages.slice();
+    clearDeferredRuntimeMessages();
+    replayingDeferredRuntimeMessages = true;
+    try {
+      pending.forEach((item) => handleServerMessage(item));
+    } finally {
+      replayingDeferredRuntimeMessages = false;
+    }
+  }
+
+  function shouldDeferRuntimeMessage(msg) {
+    if (replayingDeferredRuntimeMessages) return false;
+    if (!activeSessionLoad) return false;
+    if (!isRuntimeStreamMessage(msg.type)) return false;
+    if (msg.sessionId && msg.sessionId !== activeSessionLoad.sessionId) return false;
+    return true;
+  }
+
   // --- Server Message Handler ---
   function handleServerMessage(msg) {
+    if (shouldDeferRuntimeMessage(msg)) {
+      queueDeferredRuntimeMessage(msg);
+      return;
+    }
     switch (msg.type) {
       case 'auth_result':
         if (msg.success) {
+          pendingLoginPassword = '';
+          isAuthenticated = true;
           authToken = msg.token;
+          isRootOrSudo = !!msg.isRootOrSudo;
           localStorage.setItem('cc-web-token', msg.token);
           document.dispatchEvent(new CustomEvent('cc-web-auth-restored'));
           loginOverlay.hidden = true;
@@ -1495,19 +2601,39 @@
           } else {
             pendingInitialSessionLoad = true;
           }
+          syncModePickerText();
+          loadCommandHistoryFromServer().catch(() => {});
+          syncRunningCommandFromServer({ force: true }).catch(() => {});
+          renderCmdPanel();
+          refreshFileBrowser(fileBrowserPath || currentCwd || '').catch(() => {});
         } else {
+          isAuthenticated = false;
+          const canRetryWithPassword = !!(loginPasswordValue || pendingLoginPassword || localStorage.getItem('cc-web-pw'));
+          if (msg.tokenExpired && canRetryWithPassword && !msg.banned) {
+            authToken = null;
+            localStorage.removeItem('cc-web-token');
+            submitLogin(loginPasswordValue || pendingLoginPassword || localStorage.getItem('cc-web-pw') || '');
+            return;
+          }
           authToken = null;
           localStorage.removeItem('cc-web-token');
           document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
           loginOverlay.hidden = false;
           app.hidden = true;
+          loginPassword.disabled = false;
+          loginForm.querySelector('button[type="submit"]').disabled = false;
           if (msg.banned) {
-            loginError.textContent = '该 IP 已被永久封禁';
+            const remaining = msg.banInfo?.permanent
+              ? '永久'
+              : formatDuration(msg.banInfo?.remainingMs || 0);
+            const until = msg.banInfo?.permanent
+              ? '请手动解封'
+              : `预计 ${formatDateTime(msg.banInfo?.expiresAtIso)} 自动解封`;
+            loginError.textContent = `该 IP 已被封禁，剩余 ${remaining}。${until}`;
             loginError.hidden = false;
-            loginPassword.disabled = true;
-            loginForm.querySelector('button[type="submit"]').disabled = true;
           } else {
-            loginError.textContent = '密码错误';
+            const attempts = Number.isFinite(msg.remainingAttempts) ? `，还可再试 ${msg.remainingAttempts} 次` : '';
+            loginError.textContent = `密码错误${attempts}`;
             loginError.hidden = false;
           }
         }
@@ -1534,9 +2660,10 @@
           activeSessionLoad.snapshot = snapshot;
         }
         applySessionSnapshot(snapshot, {
-          immediate: isBlockingSessionLoad(msg.sessionId),
+          immediate: isBlockingSessionLoad(msg.sessionId) || activeSessionLoad?.sessionId === msg.sessionId,
           suppressUnreadToast: false,
           preserveStreaming: msg.sessionId === currentSessionId && msg.isRunning,
+          preserveScroll: activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.preserveScroll,
         });
         if (!msg.historyPending) {
           if (activeSessionLoad?.sessionId === msg.sessionId) {
@@ -1554,13 +2681,12 @@
           if (activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.snapshot) {
             activeSessionLoad.snapshot.messages = cloneMessages(msg.messages || []).concat(activeSessionLoad.snapshot.messages);
           }
-          prependHistoryMessages(msg.messages || [], {
-            preserveScroll: !blocking,
-            skipScrollbar: blocking,
+          enqueueHistoryChunk({
+            sessionId: msg.sessionId,
+            messages: msg.messages || [],
+            blocking,
+            remaining: msg.remaining,
           });
-          if (!msg.remaining) {
-            finalizeLoadedSession(msg.sessionId);
-          }
         }
         break;
 
@@ -1720,8 +2846,21 @@
         if (typeof _onDevConfig === 'function') _onDevConfig(msg.config);
         break;
 
+      case 'security_status':
+        securityStatusCache = msg || null;
+        if (typeof _onSecurityStatus === 'function') _onSecurityStatus(msg);
+        break;
+
+      case 'security_action_result':
+        if (typeof _onSecurityActionResult === 'function') _onSecurityActionResult(msg);
+        break;
+
       case 'fetch_models_result':
         if (typeof _onFetchModelsResult === 'function') _onFetchModelsResult(msg);
+        break;
+
+      case 'exec_stream':
+        handleExecStreamMessage(msg);
         break;
 
       case 'background_done':
@@ -1730,7 +2869,7 @@
         showBrowserNotification(msg.title);
         if (msg.sessionId === currentSessionId) {
           // Reload current session to show completed response
-          openSession(msg.sessionId, { forceSync: true, blocking: false });
+          openSession(msg.sessionId, { forceSync: true, blocking: false, preserveScroll: true });
         } else {
           send({ type: 'list_sessions' });
         }
@@ -1760,6 +2899,7 @@
 
   // --- Generating State ---
   function startGenerating() {
+    const shouldFollowOutput = isNearBottom();
     isGenerating = true;
     setCurrentSessionRunningState(true);
     pendingText = '';
@@ -1786,7 +2926,7 @@
     bubble.appendChild(textDiv);
     bubble.appendChild(toolsDiv);
     messagesDiv.appendChild(msgEl);
-    scrollToBottom();
+    if (shouldFollowOutput) scrollToBottom();
   }
 
   function finishGenerating(sessionId) {
@@ -1849,12 +2989,13 @@
   function flushRender() {
     const streamEl = document.getElementById('streaming-msg');
     if (!streamEl) return;
+    const shouldFollowOutput = isNearBottom();
     const bubble = streamEl.querySelector('.msg-bubble');
     if (!bubble) return;
     let textDiv = bubble.querySelector('.msg-text');
     if (!textDiv) { textDiv = bubble; }
     textDiv.innerHTML = renderMarkdown(pendingText);
-    scrollToBottom();
+    if (shouldFollowOutput) scrollToBottom();
   }
 
   function renderMarkdown(text) {
@@ -2049,6 +3190,8 @@
   function renderMessages(messages, options = {}) {
     renderEpoch++;
     const epoch = renderEpoch;
+    const preserveScroll = options.preserveScroll === true;
+    const previousScrollTop = Number.isFinite(options.previousScrollTop) ? options.previousScrollTop : messagesDiv.scrollTop;
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
       messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
@@ -2058,7 +3201,12 @@
       const frag = document.createDocumentFragment();
       messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
       messagesDiv.appendChild(frag);
-      scrollToBottom();
+      if (preserveScroll) {
+        messagesDiv.scrollTop = previousScrollTop;
+        updateScrollbar();
+      } else {
+        scrollToBottom();
+      }
       return;
     }
     // Batch render: last 10 first, then next 20, then the rest
@@ -2079,7 +3227,12 @@
     const frag0 = document.createDocumentFragment();
     for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
     messagesDiv.appendChild(frag0);
-    scrollToBottom();
+    if (preserveScroll) {
+      messagesDiv.scrollTop = previousScrollTop;
+      updateScrollbar();
+    } else {
+      scrollToBottom();
+    }
 
     // Render remaining batches asynchronously, prepending each
     // Use scrollHeight delta to keep current view position stable after prepend
@@ -2361,6 +3514,7 @@
   }
 
   function appendToolCall(toolUseId, name, input, done, kind = null, meta = null) {
+    const shouldFollowOutput = isNearBottom();
     const streamEl = document.getElementById('streaming-msg');
     if (!streamEl) return;
     const bubble = streamEl.querySelector('.msg-bubble');
@@ -2396,7 +3550,7 @@
       _refreshGroupSummary(group);
     }
     toolsDiv.appendChild(details);
-    scrollToBottom();
+    if (shouldFollowOutput) scrollToBottom();
   }
 
   function _refreshGroupSummary(group) {
@@ -2464,18 +3618,24 @@
   }
 
   function appendSystemMessage(message) {
+    const shouldFollowOutput = isNearBottom();
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     messagesDiv.appendChild(createMsgElement('system', message));
-    scrollToBottom();
+    if (shouldFollowOutput) scrollToBottom();
   }
 
   function appendError(message) {
+    const shouldFollowOutput = isNearBottom();
     const div = document.createElement('div');
     div.className = 'msg system';
     div.innerHTML = `<div class="msg-bubble" style="border-color:var(--danger);color:var(--danger)">⚠ ${escapeHtml(message)}</div>`;
     messagesDiv.appendChild(div);
-    scrollToBottom();
+    if (shouldFollowOutput) scrollToBottom();
+  }
+
+  function isNearBottom(threshold = 80) {
+    return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight <= threshold;
   }
 
   function scrollToBottom() {
@@ -2963,7 +4123,7 @@
   }
 
   function showModePicker() {
-    showOptionPicker('选择权限模式', MODE_PICKER_OPTIONS, currentMode, (value) => {
+    showOptionPicker('选择权限模式', getModePickerOptions(), currentMode, (value) => {
       currentMode = value;
       modeSelect.value = currentMode;
       localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
@@ -3044,7 +4204,7 @@
     } else {
       localStorage.removeItem('cc-web-pw');
     }
-    send({ type: 'auth', password: pw });
+    submitLogin(pw);
     // Request notification permission on first user interaction
     requestNotificationPermission();
   });
@@ -3133,8 +4293,8 @@
     if (currentSessionId) {
       send({ type: 'set_mode', sessionId: currentSessionId, mode: currentMode });
     }
-    if (currentMode === 'default') {
-      appendSystemMessage('⚠ 由于项目设计与 CLI 原生逻辑不同，默认模式的授权申请功能暂未实现，建议搭配 Plan 或 YOLO 模式使用。');
+    if (currentAgent === 'codex' && currentMode === 'plan') {
+      appendSystemMessage('⚠ Codex 的 Plan 模式会以只读沙箱运行，适合先分析方案；如果需要直接改文件，请切回 default 或 yolo。');
     }
   });
 
@@ -3560,6 +4720,17 @@
 
       <div class="settings-divider"></div>
 
+      <div class="settings-section-title">安全</div>
+      <button class="settings-nav-card" type="button" data-open-security-page>
+        <span class="settings-nav-card-main">
+          <span class="settings-nav-card-title">安全与访问</span>
+          <span class="settings-nav-card-meta">查看封禁 IP / 手动解封</span>
+        </span>
+        <span class="settings-nav-card-arrow" aria-hidden="true">›</span>
+      </button>
+
+      <div class="settings-divider"></div>
+
       <div class="settings-section-title">开发者</div>
       <button class="settings-nav-card" type="button" data-open-dev-page>
         <span class="settings-nav-card-main">
@@ -3585,6 +4756,8 @@
     if (themePageBtn) themePageBtn.addEventListener('click', openThemeSubpage);
     const notifyPageBtn2 = panel.querySelector('[data-open-notify-page]');
     if (notifyPageBtn2) notifyPageBtn2.addEventListener('click', openNotifySubpage);
+    const securityPageBtn = panel.querySelector('[data-open-security-page]');
+    if (securityPageBtn) securityPageBtn.addEventListener('click', openSecuritySubpage);
     const devPageBtn = panel.querySelector('[data-open-dev-page]');
     if (devPageBtn) devPageBtn.addEventListener('click', openDevSettingsSubpage);
 
@@ -4291,6 +5464,8 @@
     _onClaudeLocalConfig = null;
     _onCodexLocalConfig = null;
     _onDevConfig = null;
+    _onSecurityStatus = null;
+    _onSecurityActionResult = null;
     window._ccOnUpdateInfo = null;
     document.removeEventListener('keydown', _settingsEscape);
   }
@@ -4484,6 +5659,123 @@
   // --- New Session Modal ---
   let _onCwdSuggestions = null;
 
+  function openDirectoryPicker(options = {}) {
+    const title = options.title || '选择目录';
+    const confirmLabel = options.confirmLabel || '使用此目录';
+    const description = String(options.description || '').trim();
+    const initialPath = String(options.initialPath || '').trim();
+
+    return new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.innerHTML = `
+        <div class="modal-panel modal-panel-wide ns-dir-picker-panel">
+          <div class="modal-header">
+            <span class="modal-title">${escapeHtml(title)}</span>
+            <button class="modal-close-btn" id="ns-dir-picker-close">✕</button>
+          </div>
+          <div class="modal-body">
+            ${description ? `<div class="settings-inline-note ns-dir-picker-note">${escapeHtml(description)}</div>` : ''}
+            <div class="ns-dir-picker-toolbar">
+              <input type="text" id="ns-dir-picker-path" class="modal-text-input" placeholder="输入目录路径" value="${escapeAttr(initialPath)}">
+              <button class="btn-test" id="ns-dir-picker-go" type="button">打开</button>
+              <button class="btn-test" id="ns-dir-picker-up" type="button">上一级</button>
+              <button class="btn-test" id="ns-dir-picker-refresh" type="button">刷新</button>
+            </div>
+            <div class="ns-dir-picker-current" id="ns-dir-picker-current"></div>
+            <div class="file-browser-list ns-dir-picker-list" id="ns-dir-picker-list"></div>
+            <div class="file-browser-status" id="ns-dir-picker-status"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="modal-btn-secondary" id="ns-dir-picker-cancel">取消</button>
+            <button class="modal-btn-primary" id="ns-dir-picker-ok">${escapeHtml(confirmLabel)}</button>
+          </div>
+        </div>
+      `;
+
+      document.body.appendChild(overlay);
+
+      const pathInput = overlay.querySelector('#ns-dir-picker-path');
+      const currentEl = overlay.querySelector('#ns-dir-picker-current');
+      const listEl = overlay.querySelector('#ns-dir-picker-list');
+      const statusEl = overlay.querySelector('#ns-dir-picker-status');
+      const okBtn = overlay.querySelector('#ns-dir-picker-ok');
+
+      let currentPath = initialPath;
+      let currentParent = null;
+      let loading = false;
+      let closed = false;
+
+      function close(result = null) {
+        if (closed) return;
+        closed = true;
+        overlay.remove();
+        resolve(result);
+      }
+
+      async function loadDir(targetPath = currentPath) {
+        if (loading) return;
+        loading = true;
+        statusEl.textContent = '加载中...';
+        listEl.innerHTML = '';
+        okBtn.disabled = true;
+        try {
+          const result = await apiFetch(`/api/fs/list?path=${encodeURIComponent(targetPath || '')}`);
+          const dirEntries = (result.entries || []).filter((entry) => entry.type === 'dir');
+          currentPath = result.cwd || '';
+          currentParent = result.parent || null;
+          pathInput.value = currentPath;
+          currentEl.textContent = `当前目录：${currentPath}`;
+          listEl.innerHTML = [
+            currentParent ? `
+              <button type="button" class="file-browser-item ns-dir-picker-item" data-nav-path="${escapeAttr(currentParent)}">
+                <span>↩</span>
+                <span class="file-browser-item-name">..</span>
+                <span class="file-browser-item-meta">上一级</span>
+              </button>
+            ` : '',
+            ...dirEntries.map((entry) => `
+              <button type="button" class="file-browser-item ns-dir-picker-item" data-nav-path="${escapeAttr(entry.path)}">
+                <span>📁</span>
+                <span class="file-browser-item-name" title="${escapeAttr(entry.path)}">${escapeHtml(entry.name)}</span>
+                <span class="file-browser-item-meta">目录</span>
+              </button>
+            `),
+          ].join('') || '<div class="file-browser-item"><span class="file-browser-item-meta">当前目录下没有子目录</span></div>';
+          statusEl.textContent = currentParent ? `${dirEntries.length} 个子目录 · 可进入上一级` : `${dirEntries.length} 个子目录`;
+          okBtn.disabled = !currentPath;
+          listEl.querySelectorAll('[data-nav-path]').forEach((btn) => {
+            btn.addEventListener('click', () => loadDir(btn.dataset.navPath || ''));
+          });
+        } catch (err) {
+          statusEl.textContent = err.message || '读取目录失败';
+          currentEl.textContent = '';
+          listEl.innerHTML = '<div class="file-browser-item"><span class="file-browser-item-meta">无法读取该目录</span></div>';
+        } finally {
+          loading = false;
+        }
+      }
+
+      overlay.querySelector('#ns-dir-picker-close').addEventListener('click', () => close(null));
+      overlay.querySelector('#ns-dir-picker-cancel').addEventListener('click', () => close(null));
+      overlay.querySelector('#ns-dir-picker-go').addEventListener('click', () => loadDir(pathInput.value));
+      overlay.querySelector('#ns-dir-picker-refresh').addEventListener('click', () => loadDir(currentPath || pathInput.value));
+      overlay.querySelector('#ns-dir-picker-up').addEventListener('click', () => {
+        if (currentParent) loadDir(currentParent);
+      });
+      overlay.querySelector('#ns-dir-picker-ok').addEventListener('click', () => close(currentPath || pathInput.value.trim() || null));
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+      pathInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          loadDir(pathInput.value);
+        }
+      });
+
+      loadDir(initialPath);
+    });
+  }
+
   function showNewSessionModal() {
     const targetAgent = currentAgent;
     const targetLabel = AGENT_LABELS[targetAgent] || AGENT_LABELS.claude;
@@ -4540,16 +5832,43 @@
     switchTab('local');
 
     // --- Local task view ---
-    const pinned = getPinnedCwds(targetAgent);
-    const recent = getRecentCwds().filter(p => !pinned.includes(p));
-    const dirs = [...pinned, ...recent].slice(0, 5);
-
     let selectedLocalIndex = 0;
+    let customLocalCwd = '';
+    const localDirDrafts = new Map();
+
+    function getLocalDirState() {
+      const currentPinned = getPinnedCwds(targetAgent);
+      const currentRecent = getRecentCwds().filter((p) => !currentPinned.includes(p));
+      const filledDirs = [...currentPinned, ...currentRecent].slice(0, 4);
+      return { currentPinned, filledDirs };
+    }
+
+    function getDraftLocalDir(dir) {
+      return localDirDrafts.has(dir) ? localDirDrafts.get(dir) : dir;
+    }
+
+    function setSelectedLocalRow(index) {
+      selectedLocalIndex = index;
+      localView.querySelectorAll('[data-local-row]').forEach((row) => {
+        const rowIndex = Number(row.dataset.localRow);
+        const selected = rowIndex === selectedLocalIndex;
+        row.classList.toggle('is-selected', selected);
+        const radio = row.querySelector('.ns-cwd-radio');
+        if (radio) radio.checked = selected;
+      });
+    }
+
+    function getSelectedLocalCwd() {
+      const { filledDirs } = getLocalDirState();
+      if (selectedLocalIndex === filledDirs.length) {
+        return customLocalCwd.trim();
+      }
+      const sourceDir = filledDirs[selectedLocalIndex] || '';
+      return String(getDraftLocalDir(sourceDir) || '').trim();
+    }
 
     function renderLocalView() {
-      const currentPinned = getPinnedCwds(targetAgent);
-      const currentRecent = getRecentCwds().filter(p => !currentPinned.includes(p));
-      const filledDirs = [...currentPinned, ...currentRecent].slice(0, 4);
+      const { currentPinned, filledDirs } = getLocalDirState();
       const maxIndex = filledDirs.length;
       if (selectedLocalIndex > maxIndex) selectedLocalIndex = maxIndex;
 
@@ -4559,53 +5878,63 @@
             const isPinned = currentPinned.includes(dir);
             const isSelected = selectedLocalIndex === i;
             return `
-              <div class="ns-cwd-row" data-local-row="${i}" style="display:flex;gap:6px;align-items:center;padding:4px 6px;border:1px solid ${isSelected ? 'var(--accent)' : 'transparent'};border-radius:8px;background:${isSelected ? 'var(--accent-dim,rgba(100,150,255,0.08))' : 'transparent'};cursor:pointer">
+              <div class="ns-cwd-row${isSelected ? ' is-selected' : ''}" data-local-row="${i}">
                 <input type="radio" name="ns-local-cwd" class="ns-cwd-radio" data-local-radio="${i}" ${isSelected ? 'checked' : ''}>
-                <input type="text" class="modal-text-input ns-cwd-item" value="${escapeHtml(dir)}" data-idx="${i}" style="flex:1;${isPinned ? '' : 'opacity:0.6'}">
-                <button class="btn-test ns-pin-btn" data-idx="${i}" data-cwd="${escapeHtml(dir)}" style="padding:2px 6px;font-size:0.9em;${isPinned ? 'color:var(--accent)' : ''}" title="${isPinned ? '取消固定' : '固定'}">${isPinned ? '★' : '☆'}</button>
-                <button class="btn-test ns-del-dir-btn" data-idx="${i}" data-cwd="${escapeHtml(dir)}" style="padding:2px 6px;font-size:0.9em" title="移除">✕</button>
+                <input type="text" class="modal-text-input ns-cwd-item" value="${escapeAttr(getDraftLocalDir(dir))}" data-idx="${i}" data-cwd-key="${escapeAttr(dir)}" style="flex:1;${isPinned ? '' : 'opacity:0.6'}">
+                <button class="btn-test ns-pin-btn" data-idx="${i}" data-cwd-key="${escapeAttr(dir)}" style="padding:2px 6px;font-size:0.9em;${isPinned ? 'color:var(--accent)' : ''}" title="${isPinned ? '取消固定' : '固定'}">${isPinned ? '★' : '☆'}</button>
+                <button class="btn-test ns-del-dir-btn" data-idx="${i}" data-cwd-key="${escapeAttr(dir)}" style="padding:2px 6px;font-size:0.9em" title="移除">✕</button>
               </div>
             `;
           }).join('')}
-          <div class="ns-cwd-row" data-local-row="${filledDirs.length}" style="display:flex;gap:6px;align-items:center;padding:4px 6px;border:1px solid ${selectedLocalIndex === filledDirs.length ? 'var(--accent)' : 'transparent'};border-radius:8px;background:${selectedLocalIndex === filledDirs.length ? 'var(--accent-dim,rgba(100,150,255,0.08))' : 'transparent'};cursor:pointer">
+          <div class="ns-cwd-row${selectedLocalIndex === filledDirs.length ? ' is-selected' : ''}" data-local-row="${filledDirs.length}">
             <input type="radio" name="ns-local-cwd" class="ns-cwd-radio" data-local-radio="${filledDirs.length}" ${selectedLocalIndex === filledDirs.length ? 'checked' : ''}>
-            <input type="text" id="ns-cwd-custom" class="modal-text-input" placeholder="输入自定义目录" style="flex:1">
+            <input type="text" id="ns-cwd-custom" class="modal-text-input" placeholder="输入自定义目录" style="flex:1" value="${escapeAttr(customLocalCwd)}">
+            <button class="btn-test" id="ns-choose-dir-btn" type="button" style="padding:6px 10px;white-space:nowrap">选择</button>
           </div>
         </div>
       `;
 
       localView.querySelectorAll('[data-local-row]').forEach(row => {
         row.addEventListener('click', (e) => {
-          if (e.target.closest('.ns-pin-btn') || e.target.closest('.ns-del-dir-btn')) return;
-          selectedLocalIndex = Number(row.dataset.localRow);
-          renderLocalView();
+          if (e.target.closest('.ns-pin-btn') || e.target.closest('.ns-del-dir-btn') || e.target.closest('#ns-choose-dir-btn')) return;
+          setSelectedLocalRow(Number(row.dataset.localRow));
         });
       });
 
-      localView.querySelectorAll('.ns-cwd-item, #ns-cwd-custom').forEach(input => {
+      localView.querySelectorAll('.ns-cwd-item').forEach((input) => {
+        input.addEventListener('input', () => {
+          const cwdKey = input.dataset.cwdKey || '';
+          if (!cwdKey) return;
+          localDirDrafts.set(cwdKey, input.value);
+        });
         input.addEventListener('focus', () => {
           const row = input.closest('[data-local-row]');
           if (!row) return;
-          selectedLocalIndex = Number(row.dataset.localRow);
-          renderLocalView();
-          const freshInput = localView.querySelector(row.dataset.localRow === String(filledDirs.length) ? '#ns-cwd-custom' : `.ns-cwd-item[data-idx="${row.dataset.localRow}"]`);
-          if (freshInput) {
-            const val = freshInput.value;
-            freshInput.focus();
-            if (typeof freshInput.setSelectionRange === 'function') freshInput.setSelectionRange(val.length, val.length);
-          }
+          setSelectedLocalRow(Number(row.dataset.localRow));
         });
       });
+
+      const customInput = localView.querySelector('#ns-cwd-custom');
+      if (customInput) {
+        customInput.addEventListener('input', () => {
+          customLocalCwd = customInput.value;
+        });
+        customInput.addEventListener('focus', () => {
+          const row = customInput.closest('[data-local-row]');
+          if (!row) return;
+          setSelectedLocalRow(Number(row.dataset.localRow));
+        });
+      }
 
       localView.querySelectorAll('.ns-pin-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
-          const rowInput = btn.closest('[data-local-row]')?.querySelector('.ns-cwd-item');
-          const cwd = rowInput?.value?.trim() || btn.dataset.cwd;
+          const sourceCwd = btn.dataset.cwdKey || '';
+          const cwd = String(getDraftLocalDir(sourceCwd) || sourceCwd).trim();
           if (!cwd) return;
           const currentPinned2 = getPinnedCwds(targetAgent);
-          if (currentPinned2.includes(cwd)) {
-            removePinnedCwd(targetAgent, cwd);
+          if (currentPinned2.includes(sourceCwd) && cwd === sourceCwd) {
+            removePinnedCwd(targetAgent, sourceCwd);
           } else {
             savePinnedCwd(targetAgent, cwd);
           }
@@ -4617,16 +5946,42 @@
       localView.querySelectorAll('.ns-del-dir-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
-          const rowInput = btn.closest('[data-local-row]')?.querySelector('.ns-cwd-item');
-          const cwd = rowInput?.value?.trim() || btn.dataset.cwd;
-          if (!cwd) return;
-          removePinnedCwd(targetAgent, cwd);
-          let recents = getRecentCwds().filter(p => p !== cwd);
+          const sourceCwd = btn.dataset.cwdKey || '';
+          const editedCwd = String(getDraftLocalDir(sourceCwd) || '').trim();
+          if (!sourceCwd && !editedCwd) return;
+          removePinnedCwd(targetAgent, sourceCwd);
+          if (editedCwd && editedCwd !== sourceCwd) removePinnedCwd(targetAgent, editedCwd);
+          let recents = getRecentCwds().filter((p) => p !== sourceCwd && p !== editedCwd);
           try { localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(recents)); } catch {}
+          localDirDrafts.delete(sourceCwd);
           if (selectedLocalIndex > 0) selectedLocalIndex -= 1;
           renderLocalView();
         });
       });
+
+      const chooseDirBtn = localView.querySelector('#ns-choose-dir-btn');
+      if (chooseDirBtn) {
+        chooseDirBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          setSelectedLocalRow(filledDirs.length);
+          const pickedPath = await openDirectoryPicker({
+            title: '选择本地工作目录',
+            confirmLabel: '使用此目录',
+            initialPath: customLocalCwd.trim() || getSelectedLocalCwd() || currentCwd || '',
+            description: '浏览当前 CC-Web 所在服务器上的文件系统，选择一个目录作为新会话工作目录。',
+          });
+          if (!pickedPath) return;
+          customLocalCwd = pickedPath;
+          const freshCustomInput = localView.querySelector('#ns-cwd-custom');
+          if (freshCustomInput) {
+            freshCustomInput.value = pickedPath;
+            freshCustomInput.focus();
+            if (typeof freshCustomInput.setSelectionRange === 'function') {
+              freshCustomInput.setSelectionRange(pickedPath.length, pickedPath.length);
+            }
+          }
+        });
+      }
     }
 
     renderLocalView();
@@ -4687,14 +6042,7 @@
 
     overlay.querySelector('#ns-create-btn').addEventListener('click', () => {
       if (currentTab === 'local') {
-        const customInput = localView.querySelector('#ns-cwd-custom');
-        const editedItems = Array.from(localView.querySelectorAll('.ns-cwd-item')).map(input => input.value.trim());
-        let cwd = null;
-        if (selectedLocalIndex === editedItems.length) {
-          cwd = customInput?.value?.trim() || null;
-        } else {
-          cwd = editedItems[selectedLocalIndex] || null;
-        }
+        const cwd = getSelectedLocalCwd() || null;
         if (!cwd) {
           alert('请选择或输入工作目录');
           return;
@@ -4923,9 +6271,21 @@
   // --- Init ---
   applyTheme(currentTheme);
   setCurrentAgent(currentAgent);
+  loadCommandHistory();
+  loadSidebarToolsHeight();
   renderSessionList();
+  renderFileBrowserShell();
+  renderCmdPanel();
+  bindSidebarToolsHeightResizer();
+  if (toolTabFiles) toolTabFiles.addEventListener('click', () => switchToolTab('files'));
+  if (toolTabCmd) toolTabCmd.addEventListener('click', () => switchToolTab('cmd'));
+  switchToolTab('files');
+  applySidebarToolsHeight(sidebarToolsHeightPx, { skipPersist: true });
   connect();
-  window.addEventListener('resize', updateCwdBadge);
+  window.addEventListener('resize', () => {
+    updateCwdBadge();
+    applySidebarToolsHeight(sidebarToolsHeightPx, { skipPersist: true });
+  });
 
   // Register Service Worker for mobile push notifications
   if ('serviceWorker' in navigator) {
@@ -4946,20 +6306,20 @@
       // WS is dead, force reconnect
       connect();
     } else if (ws.readyState === 1 && currentSessionId) {
+      syncRunningCommandFromServer({ force: true }).catch(() => {});
       // Preserve active streaming UI when returning to foreground.
       if (isGenerating || currentSessionRunning) {
         send({ type: 'load_session', sessionId: currentSessionId });
       } else {
-        beginSessionSwitch(currentSessionId, { blocking: false, force: true });
+        beginSessionSwitch(currentSessionId, { blocking: false, force: true, preserveScroll: true });
       }
+    } else if (ws.readyState === 1) {
+      syncRunningCommandFromServer({ force: true }).catch(() => {});
     }
   });
 
-  if (!authToken) {
-    loginOverlay.hidden = false;
-    app.hidden = true;
-  } else {
-    loginOverlay.hidden = true;
-    app.hidden = false;
-  }
+  // A saved token only means "try to restore"; the app becomes visible after
+  // the server confirms it with auth_result.success.
+  loginOverlay.hidden = false;
+  app.hidden = true;
 })();

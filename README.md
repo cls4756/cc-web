@@ -105,6 +105,24 @@ copy .env.example .env  & REM 可选
 - **密码要求**：≥ 8 位，包含大写/小写/数字/特殊字符中的至少 2 种
 - **改密后**：所有已登录会话失效，需重新认证
 
+### 登录失败与 IP 封禁
+
+- **触发条件**：同一 IP 在 5 分钟内连续输错密码 3 次
+- **封禁时长**：默认封禁 7 天，不是永久封禁
+- **Web UI 查看/解封**：设置面板 → 安全与访问
+- **封禁记录文件**：`config/banned_ips.json`
+- **密码文件**：`config/auth.json`
+
+如已无法登录，可在项目目录执行离线管理命令：
+
+```bash
+node scripts/auth-admin.js show-password
+node scripts/auth-admin.js set-password 'NewPassword123!'
+node scripts/auth-admin.js list-bans
+node scripts/auth-admin.js unban 1.2.3.4
+node scripts/auth-admin.js clear-bans
+```
+
 ## 项目结构
 
 ```

@@ -100,6 +100,24 @@ Passwords are stored in `config/auth.json` and support generation + UI updates:
 - **Password policy**: at least 8 characters, with at least 2 of these categories: uppercase, lowercase, number, special character.
 - **After password change**: all existing logged-in sessions are invalidated.
 
+### Failed Login and IP Ban
+
+- **Trigger**: 3 failed password attempts from the same IP within 5 minutes
+- **Ban duration**: 7 days by default, not permanent
+- **View / unban in UI**: Settings panel → Security & Access
+- **Ban record file**: `config/banned_ips.json`
+- **Password file**: `config/auth.json`
+
+If you are locked out, use the offline admin helper from the project root:
+
+```bash
+node scripts/auth-admin.js show-password
+node scripts/auth-admin.js set-password 'NewPassword123!'
+node scripts/auth-admin.js list-bans
+node scripts/auth-admin.js unban 1.2.3.4
+node scripts/auth-admin.js clear-bans
+```
+
 ## Project Structure
 
 ```text
