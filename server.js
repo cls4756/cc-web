@@ -16,7 +16,7 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const PORT = parseInt(process.env.PORT) || 8002;
+const PORT = parseInt(process.env.PORT) || 8012;
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
@@ -469,6 +469,18 @@ function saveAuthTokens() {
   } catch {}
 }
 
+// debounce 异步写：登录成功后 rememberAuthToken 每次都写盘代价不必要，
+// 合并 200ms 内的多次写入，并改用异步 API 避免阻塞事件循环。
+let authTokensWriteTimer = null;
+function scheduleSaveAuthTokens() {
+  if (authTokensWriteTimer) return;
+  authTokensWriteTimer = setTimeout(() => {
+    authTokensWriteTimer = null;
+    const obj = Object.fromEntries(activeTokens);
+    fs.writeFile(AUTH_TOKENS_PATH, JSON.stringify(obj, null, 2), () => {});
+  }, 200);
+}
+
 function loadAuthTokens() {
   try {
     if (!fs.existsSync(AUTH_TOKENS_PATH)) return;
@@ -487,7 +499,7 @@ function loadAuthTokens() {
 function rememberAuthToken(token) {
   if (!token) return;
   activeTokens.set(token, Date.now());
-  saveAuthTokens();
+  scheduleSaveAuthTokens();
 }
 
 function clearAuthTokens() {
@@ -500,7 +512,7 @@ function isTokenValid(token) {
   const now = Date.now();
   if (now - activeTokens.get(token) > TOKEN_TTL) {
     activeTokens.delete(token);
-    saveAuthTokens();
+    scheduleSaveAuthTokens();
     return false;
   }
   rememberAuthToken(token);
@@ -834,6 +846,7 @@ function saveCodexConfig(config) {
       models: normalizeCodexModelList(profile?.models, profile?.model),
     })).filter((profile) => profile.name) : [],
     enableSearch: false,
+    localSnapshot: config.localSnapshot || {},
   }, null, 2));
 }
 
@@ -1125,6 +1138,40 @@ const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFI
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
+// root 用户下 Claude CLI 禁用 --dangerously-skip-permissions，YOLO 会被降级为 default。
+// 在 settings.json 里预先批准这些工具，让 default 模式也能直接编辑 / 执行命令，避免
+// 非交互子进程被权限询问卡死。
+const ROOT_FALLBACK_ALLOW_TOOLS = ['Edit', 'Write', 'MultiEdit', 'Bash', 'WebFetch', 'NotebookEdit'];
+
+function mergeRootFallbackAllow(settings) {
+  const permissions = (settings.permissions && typeof settings.permissions === 'object') ? settings.permissions : {};
+  const existing = Array.isArray(permissions.allow) ? permissions.allow : [];
+  const merged = new Set(existing);
+  for (const tool of ROOT_FALLBACK_ALLOW_TOOLS) merged.add(tool);
+  permissions.allow = Array.from(merged);
+  settings.permissions = permissions;
+  return settings;
+}
+
+function ensureRootPermissionAllowlist() {
+  if (!IS_ROOT_OR_SUDO) return;
+  let settings = {};
+  try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
+  const before = JSON.stringify(settings.permissions?.allow || []);
+  mergeRootFallbackAllow(settings);
+  const after = JSON.stringify(settings.permissions.allow);
+  if (before === after) return;
+  const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
+    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
+    fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
+  } catch {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+}
+
+ensureRootPermissionAllowlist();
 
 function applyCustomTemplateToSettings(tpl) {
   let settings = {};
@@ -1140,13 +1187,62 @@ function applyCustomTemplateToSettings(tpl) {
   if (tpl.sonnetModel)  cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tpl.sonnetModel;
   if (tpl.haikuModel)   cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tpl.haikuModel;
   settings.env = cleanedEnv;
+  if (IS_ROOT_OR_SUDO) mergeRootFallbackAllow(settings);
   // 原子写入：先写临时文件再 rename，避免 Claude 子进程读到写了一半的文件
   const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
   try {
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
     fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
     fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
-  } catch {
+  } catch (error) {
     try { fs.unlinkSync(tmpPath); } catch {}
+    throw error;
+  }
+}
+
+function atomicWriteFile(filePath, content) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, content);
+  try {
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    throw error;
+  }
+}
+
+function upsertTomlStringValue(toml, key, value) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const line = `${key} = ${tomlString(value)}`;
+  const re = new RegExp(`^\\s*${escapedKey}\\s*=.*$`, 'm');
+  if (re.test(toml)) return toml.replace(re, line);
+  const trimmed = toml.replace(/\s+$/, '');
+  return `${trimmed}${trimmed ? '\n' : ''}${line}\n`;
+}
+
+function writeCodexLocalConfig(snapshot) {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  if (!homeDir) throw new Error('无法确定 HOME 目录');
+  const codexDir = path.join(homeDir, '.codex');
+  fs.mkdirSync(codexDir, { recursive: true });
+
+  const configTomlPath = path.join(codexDir, 'config.toml');
+  let toml = '';
+  try { toml = fs.readFileSync(configTomlPath, 'utf8'); } catch {}
+  const apiBase = String(snapshot.apiBase || '').trim();
+  const model = String(snapshot.model || '').trim();
+  if (apiBase) toml = upsertTomlStringValue(toml, 'base_url', apiBase);
+  if (model) toml = upsertTomlStringValue(toml, 'model', model);
+  atomicWriteFile(configTomlPath, toml || '');
+
+  const apiKey = String(snapshot.apiKey || '').trim();
+  if (apiKey) {
+    const authJsonPath = path.join(codexDir, 'auth.json');
+    let auth = {};
+    try { auth = JSON.parse(fs.readFileSync(authJsonPath, 'utf8')); } catch {}
+    auth.OPENAI_API_KEY = apiKey;
+    atomicWriteFile(authJsonPath, JSON.stringify(auth, null, 2));
   }
 }
 
@@ -1551,9 +1647,51 @@ function loadSession(id) {
   }
 }
 
+// session 元信息内存缓存：避免 sendSessionList 每次都同步遍历所有 session 文件
+const sessionMetaCache = new Map(); // id -> { id, title, updated, hasUnread, agent }
+let sessionMetaCacheReady = false;
+
+function buildSessionMetaCacheEntry(session) {
+  if (!session?.id) return null;
+  return {
+    id: session.id,
+    title: session.title || 'Untitled',
+    updated: session.updated || null,
+    hasUnread: !!session.hasUnread,
+    agent: getSessionAgent(session),
+  };
+}
+
+function ensureSessionMetaCache() {
+  if (sessionMetaCacheReady) return;
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+    for (const f of files) {
+      try {
+        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+        const entry = buildSessionMetaCacheEntry(s);
+        if (entry) sessionMetaCache.set(entry.id, entry);
+      } catch {}
+    }
+  } catch {}
+  sessionMetaCacheReady = true;
+}
+
+function updateSessionMetaCache(session) {
+  ensureSessionMetaCache();
+  const entry = buildSessionMetaCacheEntry(session);
+  if (entry) sessionMetaCache.set(entry.id, entry);
+}
+
+function removeSessionMetaCache(sessionId) {
+  ensureSessionMetaCache();
+  sessionMetaCache.delete(sessionId);
+}
+
 function saveSession(session) {
   normalizeSession(session);
   fs.writeFileSync(sessionPath(session.id), JSON.stringify(session, null, 2));
+  updateSessionMetaCache(session);
 }
 
 function modelShortName(fullModel) {
@@ -1614,20 +1752,17 @@ function cleanRunDir(sessionId) {
 
 function sendSessionList(ws) {
   try {
-    const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'));
+    ensureSessionMetaCache();
     const sessions = [];
-    for (const f of files) {
-      try {
-        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
-        sessions.push({
-          id: s.id,
-          title: s.title || 'Untitled',
-          updated: s.updated,
-          hasUnread: !!s.hasUnread,
-          agent: getSessionAgent(s),
-          isRunning: activeProcesses.has(s.id),
-        });
-      } catch {}
+    for (const meta of sessionMetaCache.values()) {
+      sessions.push({
+        id: meta.id,
+        title: meta.title,
+        updated: meta.updated,
+        hasUnread: meta.hasUnread,
+        agent: meta.agent,
+        isRunning: activeProcesses.has(meta.id),
+      });
     }
     sessions.sort((a, b) => new Date(b.updated) - new Date(a.updated));
     wsSend(ws, { type: 'session_list', sessions });
@@ -2493,9 +2628,15 @@ const server = http.createServer((req, res) => {
       return res.end('Not Found');
     }
     const ext = path.extname(filePath);
+    const relativeStaticPath = path.relative(PUBLIC_DIR, filePath).split(path.sep).join('/');
+    const cacheControl = relativeStaticPath.startsWith('vendor/')
+      ? 'public, max-age=31536000, immutable'
+      : (ext === '.html' || relativeStaticPath === 'app.js' || relativeStaticPath === 'style.css')
+        ? 'no-cache'
+        : 'public, max-age=86400';
     res.writeHead(200, {
       'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': cacheControl,
     });
     res.end(data);
   });
@@ -2555,6 +2696,11 @@ wss.on('connection', (ws, req) => {
           isRootOrSudo: IS_ROOT_OR_SUDO,
         });
         sendSessionList(ws);
+        // 客户端在 auth 时如果带了上次查看的 session，直接顺手把 session_info 推过去，
+        // 省一次 load_session 的 RTT（移动端最受益）。
+        if (typeof msg.preferSessionId === 'string' && msg.preferSessionId) {
+          try { handleLoadSession(ws, msg.preferSessionId); } catch {}
+        }
       } else {
         const triedPassword = typeof msg.password === 'string' && msg.password.length > 0;
         const justBanned = triedPassword ? recordAuthFailure(clientIP) : false;
@@ -2663,6 +2809,15 @@ wss.on('connection', (ws, req) => {
         break;
       case 'save_local_snapshot':
         handleSaveLocalSnapshot(ws, msg);
+        break;
+      case 'save_codex_local_snapshot':
+        handleSaveCodexLocalSnapshot(ws, msg);
+        break;
+      case 'write_claude_local_config':
+        handleWriteClaudeLocalConfig(ws, msg);
+        break;
+      case 'write_codex_local_config':
+        handleWriteCodexLocalConfig(ws, msg);
         break;
       case 'restore_claude_local_snapshot':
         handleRestoreClaudeLocalSnapshot(ws);
@@ -3017,6 +3172,55 @@ function handleSaveLocalSnapshot(ws, msg) {
   saveModelConfig(config);
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '本地配置快照已保存' });
+}
+
+function handleSaveCodexLocalSnapshot(ws, msg) {
+  const current = loadCodexConfig();
+  saveCodexConfig({
+    ...current,
+    localSnapshot: msg.snapshot || {},
+  });
+  wsSend(ws, { type: 'codex_config', config: getCodexConfigMasked() });
+  wsSend(ws, { type: 'system_message', message: 'Codex 本地配置快照已保存' });
+}
+
+function handleWriteClaudeLocalConfig(ws, msg) {
+  const snapshot = msg.snapshot || {};
+  try {
+    const config = loadModelConfig();
+    config.localSnapshot = snapshot;
+    config.mode = 'local';
+    config.activeTemplate = '';
+    saveModelConfig(config);
+    applyCustomTemplateToSettings(snapshot);
+    applyModelConfig();
+    wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
+    wsSend(ws, { type: 'claude_local_config_written', ok: true });
+    wsSend(ws, { type: 'system_message', message: '已覆盖 ~/.claude/settings.json，新启动的 Claude 会话将使用新配置' });
+  } catch (error) {
+    wsSend(ws, { type: 'claude_local_config_written', ok: false, error: error.message });
+    wsSend(ws, { type: 'error', message: `覆盖 Claude 本地配置失败：${error.message}` });
+  }
+}
+
+function handleWriteCodexLocalConfig(ws, msg) {
+  const snapshot = msg.snapshot || {};
+  try {
+    const current = loadCodexConfig();
+    saveCodexConfig({
+      ...current,
+      mode: 'local',
+      activeProfile: '',
+      localSnapshot: snapshot,
+    });
+    writeCodexLocalConfig(snapshot);
+    wsSend(ws, { type: 'codex_config', config: getCodexConfigMasked() });
+    wsSend(ws, { type: 'codex_local_config_written', ok: true });
+    wsSend(ws, { type: 'system_message', message: '已覆盖 ~/.codex/config.toml 与 auth.json，新启动的 Codex 会话将使用新配置' });
+  } catch (error) {
+    wsSend(ws, { type: 'codex_local_config_written', ok: false, error: error.message });
+    wsSend(ws, { type: 'error', message: `覆盖 Codex 本地配置失败：${error.message}` });
+  }
 }
 
 function handleRestoreClaudeLocalSnapshot(ws) {
@@ -3615,6 +3819,7 @@ function handleDeleteSession(ws, sessionId) {
       removeAttachmentById(attachmentId);
     }
     if (fs.existsSync(p)) fs.unlinkSync(p);
+    removeSessionMetaCache(sessionId);
     if (sessionAgent === 'codex') {
       const result = deleteCodexLocalSession(session);
       plog('INFO', 'codex_local_session_deleted', {

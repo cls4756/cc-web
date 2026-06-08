@@ -102,6 +102,7 @@
   let isAuthenticated = false;
   let currentSessionId = null;
   let sessions = [];
+  const SESSION_LIST_CACHE_KEY = 'cc-web-session-list-cache';
   let sessionCache = new Map();
   let isGenerating = false;
   let reconnectAttempts = 0;
@@ -140,6 +141,9 @@
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
+  let initialPreferredSessionId = getLastSessionForAgent(currentAgent) || '';
+  let initialPreferredSessionApplied = false;
+  let initialPreferredFallbackTimer = null;
   let securityStatusCache = null;
   let fileBrowserRefreshSeq = 0;
   let deferredRuntimeMessages = [];
@@ -914,6 +918,25 @@
     sessionCache.delete(sessionId);
   }
 
+  function clearInitialPreferredFallback() {
+    if (initialPreferredFallbackTimer) {
+      clearTimeout(initialPreferredFallbackTimer);
+      initialPreferredFallbackTimer = null;
+    }
+  }
+
+  function scheduleInitialPreferredFallback() {
+    clearInitialPreferredFallback();
+    initialPreferredFallbackTimer = setTimeout(() => {
+      initialPreferredFallbackTimer = null;
+      if (initialPreferredSessionApplied && currentSessionId === initialPreferredSessionId) {
+        highlightActiveSession();
+        return;
+      }
+      syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
+    }, 120);
+  }
+
   function pruneSessionCache() {
     let totalWeight = 0;
     for (const entry of sessionCache.values()) totalWeight += entry.weight || 0;
@@ -1468,12 +1491,24 @@
     sidebarToolsHeightResizer.addEventListener('pointercancel', stopDragging);
   }
 
+  // 懒加载标记：第一次切到对应 tab 才发请求
+  let cmdPanelLoaded = false;
+  let fileBrowserLoaded = false;
+
   function switchToolTab(tab) {
     activeToolTab = tab === 'cmd' ? 'cmd' : 'files';
     if (toolTabFiles) toolTabFiles.classList.toggle('active', activeToolTab === 'files');
     if (toolTabCmd) toolTabCmd.classList.toggle('active', activeToolTab === 'cmd');
     if (fileBrowserPanel) fileBrowserPanel.hidden = activeToolTab !== 'files';
     if (cmdPanel) cmdPanel.hidden = activeToolTab !== 'cmd';
+    if (activeToolTab === 'cmd' && !cmdPanelLoaded && isAuthenticated) {
+      cmdPanelLoaded = true;
+      loadCommandHistoryFromServer().catch(() => {});
+    }
+    if (activeToolTab === 'files' && !fileBrowserLoaded && isAuthenticated) {
+      fileBrowserLoaded = true;
+      refreshFileBrowser(fileBrowserPath || currentCwd || '').catch(() => {});
+    }
   }
 
   function renderCmdPanel() {
@@ -2424,10 +2459,15 @@
 
     ws.onopen = () => {
       reconnectAttempts = 0;
+      // 带上上次查看的 session，让服务器在 auth 通过后顺手返回 session_info，
+      // 移动端可省去一次 load_session 的 RTT。
+      const preferSessionId = getLastSessionForAgent(currentAgent) || '';
+      initialPreferredSessionId = preferSessionId;
+      initialPreferredSessionApplied = false;
       if (pendingLoginPassword) {
-        send({ type: 'auth', password: pendingLoginPassword });
+        send({ type: 'auth', password: pendingLoginPassword, preferSessionId });
       } else if (authToken) {
-        send({ type: 'auth', token: authToken });
+        send({ type: 'auth', token: authToken, preferSessionId });
       }
     };
 
@@ -2602,10 +2642,18 @@
             pendingInitialSessionLoad = true;
           }
           syncModePickerText();
-          loadCommandHistoryFromServer().catch(() => {});
+          // 命令历史和文件浏览器是懒加载的：用户切到对应 tab 时才请求，
+          // 减少首屏并发请求，提升移动端 auth 后到出界面的速度。
           syncRunningCommandFromServer({ force: true }).catch(() => {});
           renderCmdPanel();
-          refreshFileBrowser(fileBrowserPath || currentCwd || '').catch(() => {});
+          // 当前可见 tab 触发一次首次加载
+          if (activeToolTab === 'files' && !fileBrowserLoaded) {
+            fileBrowserLoaded = true;
+            refreshFileBrowser(fileBrowserPath || currentCwd || '').catch(() => {});
+          } else if (activeToolTab === 'cmd' && !cmdPanelLoaded) {
+            cmdPanelLoaded = true;
+            loadCommandHistoryFromServer().catch(() => {});
+          }
         } else {
           isAuthenticated = false;
           const canRetryWithPassword = !!(loginPasswordValue || pendingLoginPassword || localStorage.getItem('cc-web-pw'));
@@ -2643,12 +2691,22 @@
         sessions = msg.sessions || [];
         reconcileSessionCacheWithSessions();
         renderSessionList();
+        try {
+          // 缓存一份精简列表，下次刷新时可立即渲染侧边栏
+          localStorage.setItem(SESSION_LIST_CACHE_KEY, JSON.stringify(sessions.map((s) => ({
+            id: s.id, title: s.title, updated: s.updated, agent: s.agent,
+          }))));
+        } catch {}
         if (currentSessionId) {
           setCurrentSessionRunningState(!!getSessionMeta(currentSessionId)?.isRunning);
         }
         if (pendingInitialSessionLoad) {
           pendingInitialSessionLoad = false;
-          syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
+          if (initialPreferredSessionId && getSessionMeta(initialPreferredSessionId)) {
+            scheduleInitialPreferredFallback();
+          } else {
+            syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
+          }
         } else if (currentSessionId && !getSessionMeta(currentSessionId)) {
           resetChatView(currentAgent);
         }
@@ -2656,6 +2714,10 @@
 
       case 'session_info':
         const snapshot = normalizeSessionSnapshot(msg);
+        if (msg.sessionId && msg.sessionId === initialPreferredSessionId) {
+          initialPreferredSessionApplied = true;
+          clearInitialPreferredFallback();
+        }
         if (activeSessionLoad?.sessionId === msg.sessionId) {
           activeSessionLoad.snapshot = snapshot;
         }
@@ -2925,6 +2987,7 @@
     toolsDiv.className = 'msg-tools';
     bubble.appendChild(textDiv);
     bubble.appendChild(toolsDiv);
+    addMessageCopyButton(bubble);
     messagesDiv.appendChild(msgEl);
     if (shouldFollowOutput) scrollToBottom();
   }
@@ -3004,6 +3067,56 @@
     catch { return escapeHtml(text); }
   }
 
+  function getMessageCopyText(bubble) {
+    const clone = bubble.cloneNode(true);
+    clone.querySelectorAll('.msg-copy-btn, .code-block-header, .code-preview-pane, .typing-indicator').forEach((node) => node.remove());
+    return clone.innerText.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  async function copyTextToClipboard(text) {
+    if (!text) return false;
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    textarea.remove();
+    return ok;
+  }
+
+  function addMessageCopyButton(bubble) {
+    if (bubble.querySelector(':scope > .msg-copy-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'msg-copy-btn';
+    btn.type = 'button';
+    btn.title = '复制整条消息';
+    btn.setAttribute('aria-label', '复制整条消息');
+    btn.textContent = '复制';
+    btn.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const text = getMessageCopyText(bubble);
+      try {
+        const ok = await copyTextToClipboard(text);
+        if (!ok) throw new Error('copy failed');
+        btn.textContent = '已复制';
+        showToast('已复制整条消息');
+        setTimeout(() => { btn.textContent = '复制'; }, 1200);
+      } catch {
+        showToast('复制失败，请手动选择文本');
+      }
+    });
+    bubble.appendChild(btn);
+  }
+
   function createMsgElement(role, content, attachments = []) {
     const div = document.createElement('div');
     div.className = `msg ${role}${role === 'assistant' ? ' agent-' + currentAgent : ''}`;
@@ -3049,6 +3162,7 @@
 
     div.appendChild(avatar);
     div.appendChild(bubble);
+    addMessageCopyButton(bubble);
     return div;
   }
 
@@ -5052,49 +5166,72 @@
 
     _onClaudeLocalConfig = (msg) => {
       const config = msg.config || {};
-      const hasData = config.apiKey || config.apiBase;
       const modalOverlay = document.createElement('div');
       modalOverlay.className = 'settings-overlay';
       modalOverlay.style.zIndex = '10001';
       const modal = document.createElement('div');
       modal.className = 'settings-panel';
-      modal.style.maxWidth = '460px';
-      const fields = [
-        ['API Key', config.apiKey || '(空)'],
-        ['API Base URL', config.apiBase || '(空)'],
-        ['默认模型', config.defaultModel || '(空)'],
-        ['Opus 模型', config.opusModel || '(空)'],
-        ['Sonnet 模型', config.sonnetModel || '(空)'],
-        ['Haiku 模型', config.haikuModel || '(空)'],
-      ];
+      modal.style.maxWidth = '560px';
       modal.innerHTML = `
         <div class="settings-header">
-          <h3>当前 Claude 本地配置</h3>
-          <button class="settings-close" id="read-local-close">&times;</button>
+          <h3>编辑 Claude 本地快照</h3>
+          <button class="settings-close" id="edit-local-close">&times;</button>
         </div>
-        ${msg.sourceFound ? '' : '<div class="settings-inline-note" style="color:var(--text-warning, #e8a838)">未找到 ~/.claude/settings.json，以下为空值。</div>'}
-        ${fields.map(([label, val]) => `
-          <div class="settings-field">
-            <label>${label}</label>
-            <div style="font-size:0.9em;word-break:break-all;color:var(--text-secondary)">${escapeHtml(val)}</div>
-          </div>
-        `).join('')}
-        ${hasData ? '<div class="settings-actions"><button class="btn-save" id="save-snapshot-btn">保存为快照</button></div>' : ''}
-        <div class="settings-actions"><button class="btn-save" id="read-local-ok">关闭</button></div>
+        ${msg.sourceFound ? '' : '<div class="settings-inline-note" style="color:var(--text-warning, #e8a838)">未找到 ~/.claude/settings.json，可先编辑快照后保存。</div>'}
+        <div class="settings-field">
+          <label>API Key</label>
+          <input id="edit-local-apikey" type="password" value="${escapeHtml(config.apiKey || '')}" placeholder="ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY">
+        </div>
+        <div class="settings-field">
+          <label>API Base URL</label>
+          <input id="edit-local-apibase" type="text" value="${escapeHtml(config.apiBase || '')}" placeholder="ANTHROPIC_BASE_URL">
+        </div>
+        <div class="settings-field">
+          <label>默认模型</label>
+          <input id="edit-local-default-model" type="text" value="${escapeHtml(config.defaultModel || '')}" placeholder="ANTHROPIC_MODEL">
+        </div>
+        <div class="settings-field">
+          <label>Opus 模型</label>
+          <input id="edit-local-opus-model" type="text" value="${escapeHtml(config.opusModel || '')}" placeholder="ANTHROPIC_DEFAULT_OPUS_MODEL">
+        </div>
+        <div class="settings-field">
+          <label>Sonnet 模型</label>
+          <input id="edit-local-sonnet-model" type="text" value="${escapeHtml(config.sonnetModel || '')}" placeholder="ANTHROPIC_DEFAULT_SONNET_MODEL">
+        </div>
+        <div class="settings-field">
+          <label>Haiku 模型</label>
+          <input id="edit-local-haiku-model" type="text" value="${escapeHtml(config.haikuModel || '')}" placeholder="ANTHROPIC_DEFAULT_HAIKU_MODEL">
+        </div>
+        <div class="settings-actions">
+          <button class="btn-test" id="edit-local-cancel">取消</button>
+          <button class="btn-save" id="save-snapshot-btn">保存快照</button>
+          <button class="btn-save" id="write-local-btn">覆盖本机配置</button>
+        </div>
       `;
       modalOverlay.appendChild(modal);
       document.body.appendChild(modalOverlay);
       const closeModal = () => document.body.removeChild(modalOverlay);
-      modal.querySelector('#read-local-close').addEventListener('click', closeModal);
+      modal.querySelector('#edit-local-close').addEventListener('click', closeModal);
       modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
-      modal.querySelector('#read-local-ok').addEventListener('click', closeModal);
-      const saveBtn = modal.querySelector('#save-snapshot-btn');
-      if (saveBtn) {
-        saveBtn.addEventListener('click', () => {
-          send({ type: 'save_local_snapshot', snapshot: config });
-          closeModal();
-        });
-      }
+      modal.querySelector('#edit-local-cancel').addEventListener('click', closeModal);
+      const getClaudeLocalDraft = () => ({
+        ...config,
+        apiKey: modal.querySelector('#edit-local-apikey').value.trim(),
+        apiBase: modal.querySelector('#edit-local-apibase').value.trim(),
+        defaultModel: modal.querySelector('#edit-local-default-model').value.trim(),
+        opusModel: modal.querySelector('#edit-local-opus-model').value.trim(),
+        sonnetModel: modal.querySelector('#edit-local-sonnet-model').value.trim(),
+        haikuModel: modal.querySelector('#edit-local-haiku-model').value.trim(),
+      });
+      modal.querySelector('#save-snapshot-btn').addEventListener('click', () => {
+        send({ type: 'save_local_snapshot', snapshot: getClaudeLocalDraft() });
+        closeModal();
+      });
+      modal.querySelector('#write-local-btn').addEventListener('click', () => {
+        if (!confirm('确认覆盖 ~/.claude/settings.json？新启动的 Claude 会话会直接使用这些配置。')) return;
+        send({ type: 'write_claude_local_config', snapshot: getClaudeLocalDraft() });
+        closeModal();
+      });
     };
 
     // === Codex Config UI ===
@@ -5383,33 +5520,53 @@
       modalOverlay.style.zIndex = '10001';
       const modal = document.createElement('div');
       modal.className = 'settings-panel';
-      modal.style.maxWidth = '460px';
-      const fields = [
-        ['API Key', config.apiKey || '(空)'],
-        ['API Base URL', config.apiBase || '(空)'],
-        ['模型', config.model || '(空)'],
-      ];
+      modal.style.maxWidth = '560px';
       modal.innerHTML = `
         <div class="settings-header">
-          <h3>当前 Codex 本地配置</h3>
-          <button class="settings-close" id="read-codex-local-close">&times;</button>
+          <h3>编辑 Codex 本地快照</h3>
+          <button class="settings-close" id="edit-codex-local-close">&times;</button>
         </div>
         ${msg.warning ? `<div class="settings-inline-note" style="color:var(--text-warning, #e8a838)">${escapeHtml(msg.warning)}</div>` : ''}
-        ${!msg.sourceFound ? '<div class="settings-inline-note" style="color:var(--text-warning, #e8a838)">未找到 ~/.codex/ 配置文件。</div>' : ''}
-        ${fields.map(([label, val]) => `
-          <div class="settings-field">
-            <label>${label}</label>
-            <div style="font-size:0.9em;word-break:break-all;color:var(--text-secondary)">${escapeHtml(val)}</div>
-          </div>
-        `).join('')}
-        <div class="settings-actions"><button class="btn-save" id="read-codex-local-ok">关闭</button></div>
+        ${!msg.sourceFound ? '<div class="settings-inline-note" style="color:var(--text-warning, #e8a838)">未找到 ~/.codex/ 配置文件，可先编辑快照后保存。</div>' : ''}
+        <div class="settings-field">
+          <label>API Key</label>
+          <input id="edit-codex-local-apikey" type="password" value="${escapeHtml(config.apiKey || '')}" placeholder="OPENAI_API_KEY">
+        </div>
+        <div class="settings-field">
+          <label>API Base URL</label>
+          <input id="edit-codex-local-apibase" type="text" value="${escapeHtml(config.apiBase || '')}" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="settings-field">
+          <label>模型</label>
+          <input id="edit-codex-local-model" type="text" value="${escapeHtml(config.model || '')}" placeholder="gpt-4.1">
+        </div>
+        <div class="settings-actions">
+          <button class="btn-test" id="edit-codex-local-cancel">取消</button>
+          <button class="btn-save" id="edit-codex-local-save">保存快照</button>
+          <button class="btn-save" id="write-codex-local-btn">覆盖本机配置</button>
+        </div>
       `;
       modalOverlay.appendChild(modal);
       document.body.appendChild(modalOverlay);
       const closeModal = () => document.body.removeChild(modalOverlay);
-      modal.querySelector('#read-codex-local-close').addEventListener('click', closeModal);
+      modal.querySelector('#edit-codex-local-close').addEventListener('click', closeModal);
       modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
-      modal.querySelector('#read-codex-local-ok').addEventListener('click', closeModal);
+      modal.querySelector('#edit-codex-local-cancel').addEventListener('click', closeModal);
+      const getCodexLocalDraft = () => ({
+        ...config,
+        apiKey: modal.querySelector('#edit-codex-local-apikey').value.trim(),
+        apiBase: modal.querySelector('#edit-codex-local-apibase').value.trim(),
+        model: modal.querySelector('#edit-codex-local-model').value.trim(),
+      });
+      modal.querySelector('#edit-codex-local-save').addEventListener('click', () => {
+        send({ type: 'save_codex_local_snapshot', snapshot: getCodexLocalDraft() });
+        closeModal();
+      });
+      modal.querySelector('#write-codex-local-btn').addEventListener('click', () => {
+        if (!confirm('确认覆盖 ~/.codex/config.toml 和 ~/.codex/auth.json？新启动的 Codex 会话会直接使用这些配置。')) return;
+        send({ type: 'write_codex_local_config', snapshot: getCodexLocalDraft() });
+        closeModal();
+      });
     };
 
     // === System UI ===
@@ -6318,8 +6475,30 @@
     }
   });
 
-  // A saved token only means "try to restore"; the app becomes visible after
-  // the server confirms it with auth_result.success.
-  loginOverlay.hidden = false;
-  app.hidden = true;
+  // 启动时机优化：
+  // - 有 token 时不仅隐藏登录页，连主应用都立刻显示，并用上次缓存的 session 列表
+  //   先渲染侧边栏，体感上"立即出界面"。等 auth_result 到达后服务器会下发新的
+  //   session_list 覆盖旧缓存。
+  // - 5 秒兜底，如果 WS 始终连不上，再回退到登录页。
+  const hasStoredToken = !!localStorage.getItem('cc-web-token');
+  if (hasStoredToken) {
+    loginOverlay.hidden = true;
+    app.hidden = false;
+    try {
+      const cached = JSON.parse(localStorage.getItem(SESSION_LIST_CACHE_KEY) || '[]');
+      if (Array.isArray(cached) && cached.length) {
+        sessions = cached.map((s) => ({ ...s, isRunning: false, hasUnread: false }));
+        renderSessionList();
+      }
+    } catch {}
+    setTimeout(() => {
+      if (!isAuthenticated) {
+        loginOverlay.hidden = false;
+        app.hidden = true;
+      }
+    }, 5000);
+  } else {
+    loginOverlay.hidden = false;
+    app.hidden = true;
+  }
 })();
