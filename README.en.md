@@ -62,7 +62,7 @@ copy .env.example .env  & REM optional
 
 Then run `start.bat`, or start manually with `node server.js`.
 
-After startup, open `http://localhost:8002` and sign in with your password.
+After startup, open `http://localhost:8012` and sign in with your password.
 
 ## Configuration
 
@@ -71,7 +71,7 @@ After startup, open `http://localhost:8002` and sign in with your password.
 | Variable | Required | Default | Description |
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | No | Auto-generated | Web login password (migrated into `config/auth.json` on first start) |
-| `PORT` | No | `8002` | Service port |
+| `PORT` | No | `8012` | Service port |
 | `CLAUDE_PATH` | No | `claude` | Executable path to Claude CLI |
 | `CODEX_PATH` | No | `codex` | Executable path to Codex CLI |
 | `PUSHPLUS_TOKEN` | No | - | PushPlus token (migrated into notification config on first start) |
@@ -230,7 +230,7 @@ server {
     ssl_certificate_key /path/to/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8002;
+        proxy_pass http://127.0.0.1:8012;
         proxy_http_version 1.1;
 
         # WebSocket support
@@ -260,7 +260,7 @@ node server.js
 
 **LAN access** (same Wi-Fi):
 - For security, CC-Web listens on `127.0.0.1` by default. Prefer exposing it through a reverse proxy such as Nginx, or through Tailscale / Cloudflare Tunnel, with firewall rules limiting who can connect.
-- If LAN access is required, change the bind address from `127.0.0.1` to `0.0.0.0` (for example, add `HOST=0.0.0.0` and make the startup code read it), then open `http://<your-lan-ip>:8002`.
+- If LAN access is required, change the bind address from `127.0.0.1` to `0.0.0.0` (for example, add `HOST=0.0.0.0` and make the startup code read it), then open `http://<your-lan-ip>:8012`.
 
 **Remote access**:
 - Recommended: [Tailscale](https://tailscale.com/) for secure private networking.

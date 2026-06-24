@@ -2695,11 +2695,19 @@ wss.on('connection', (ws, req) => {
           mustChangePassword: !!authConfig.mustChange,
           isRootOrSudo: IS_ROOT_OR_SUDO,
         });
-        sendSessionList(ws);
         // 客户端在 auth 时如果带了上次查看的 session，直接顺手把 session_info 推过去，
         // 省一次 load_session 的 RTT（移动端最受益）。
+        let sentPreferredSession = false;
         if (typeof msg.preferSessionId === 'string' && msg.preferSessionId) {
-          try { handleLoadSession(ws, msg.preferSessionId); } catch {}
+          try {
+            handleLoadSession(ws, msg.preferSessionId);
+            sentPreferredSession = true;
+          } catch {}
+        }
+        if (sentPreferredSession) {
+          setImmediate(() => sendSessionList(ws));
+        } else {
+          sendSessionList(ws);
         }
       } else {
         const triedPassword = typeof msg.password === 'string' && msg.password.length > 0;

@@ -64,7 +64,7 @@ copy .env.example .env  & REM 可选
 
 ---
 
-启动后访问 `http://localhost:8002`，输入密码即可使用。
+启动后访问 `http://localhost:8012`，输入密码即可使用。
 
 ## 配置
 
@@ -73,7 +73,7 @@ copy .env.example .env  & REM 可选
 | 变量 | 必填 | 默认值 | 说明 |
 |------|:---:|--------|------|
 | `CC_WEB_PASSWORD` | 否 | 自动生成 | Web 登录密码（首次启动自动迁移到 `config/auth.json`） |
-| `PORT` | 否 | `8002` | 服务监听端口 |
+| `PORT` | 否 | `8012` | 服务监听端口 |
 | `CLAUDE_PATH` | 否 | `claude` | Claude CLI 可执行文件路径 |
 | `CODEX_PATH` | 否 | `codex` | Codex CLI 可执行文件路径 |
 | `CC_WEB_CONFIG_DIR` | 否 | `./config` | 配置目录覆写（主要供隔离测试使用） |
@@ -237,7 +237,7 @@ server {
     ssl_certificate_key /path/to/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8002;
+        proxy_pass http://127.0.0.1:8012;
         proxy_http_version 1.1;
 
         # WebSocket 支持
@@ -266,7 +266,7 @@ node server.js
 
 **局域网访问**（手机和电脑在同一 WiFi）：
 - 出于安全考虑，CC-Web 默认只监听 `127.0.0.1`，推荐通过 Nginx 等反向代理、Tailscale 或 Cloudflare Tunnel 暴露访问入口，并配合防火墙限制来源。
-- 确需在局域网内使用，可将服务监听地址从 `127.0.0.1` 改为 `0.0.0.0`（例如增加 `HOST=0.0.0.0` 配置并让启动代码读取该变量），再通过 `http://电脑局域网IP:8002` 访问。
+- 确需在局域网内使用，可将服务监听地址从 `127.0.0.1` 改为 `0.0.0.0`（例如增加 `HOST=0.0.0.0` 配置并让启动代码读取该变量），再通过 `http://电脑局域网IP:8012` 访问。
 
 **远程访问**（外出时用手机控制家里电脑）：
 - 推荐使用 [Tailscale](https://tailscale.com/) — 电脑和手机各安装一个，自动组网，免费够用
