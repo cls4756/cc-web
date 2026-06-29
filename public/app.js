@@ -124,6 +124,9 @@
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  // 单条消息最多附带的图片数量。后端默认同样为 20，可用环境变量 CC_MAX_MESSAGE_ATTACHMENTS 调整；
+  // 后端会对超量部分做兜底截断，这里仅用于前端提示。
+  const MAX_MESSAGE_ATTACHMENTS = 20;
   let loginPasswordValue = ''; // store login password for force-change flow
   let isRootOrSudo = false;
   let currentCwd = null;
@@ -1902,14 +1905,32 @@
     }
   }
 
+  function attachmentUrl(id, { download = false } = {}) {
+    const params = new URLSearchParams();
+    if (authToken) params.set('token', authToken);
+    if (download) params.set('download', '1');
+    const query = params.toString();
+    return `/api/attachments/${encodeURIComponent(id)}${query ? `?${query}` : ''}`;
+  }
+
   function renderAttachmentLabels(attachments, options = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) return '';
-    const labels = attachments.map((attachment) => {
-      const stateSuffix = attachment.storageState === 'expired' ? '（已过期）' : '';
+    const items = attachments.map((attachment) => {
       const name = escapeHtml(attachment.filename || 'image');
+      if (attachment.storageState === 'available' && attachment.id) {
+        const viewUrl = escapeHtml(attachmentUrl(attachment.id));
+        const downloadUrl = escapeHtml(attachmentUrl(attachment.id, { download: true }));
+        return `<figure class="msg-attachment-item">
+          <a class="msg-attachment-thumb" href="${viewUrl}" target="_blank" rel="noopener" title="${name}（点击查看大图）">
+            <img src="${viewUrl}" alt="${name}" loading="lazy">
+          </a>
+          <a class="msg-attachment-download" href="${downloadUrl}" download="${name}" title="下载 ${name}">⬇ ${name}</a>
+        </figure>`;
+      }
+      const stateSuffix = attachment.storageState === 'expired' ? '（已过期）' : '（不可用）';
       return `<span class="msg-attachment-label">图片: ${name}${stateSuffix}</span>`;
     }).join('');
-    return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${labels}</div>`;
+    return `<div class="msg-attachments${options.compact ? ' compact' : ''}">${items}</div>`;
   }
 
   function renderPendingAttachments() {
@@ -1990,8 +2011,8 @@
   async function handleSelectedImageFiles(fileList) {
     const files = Array.from(fileList || []).filter((file) => file && /^image\//.test(file.type || ''));
     if (!files.length) return;
-    if (pendingAttachments.length + files.length > 4) {
-      appendError('单条消息最多附带 4 张图片。');
+    if (pendingAttachments.length + files.length > MAX_MESSAGE_ATTACHMENTS) {
+      appendError(`单条消息最多附带 ${MAX_MESSAGE_ATTACHMENTS} 张图片。`);
       return;
     }
     const batch = files.map((file, index) => ({

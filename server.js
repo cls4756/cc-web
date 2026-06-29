@@ -26,7 +26,7 @@ const LOGS_DIR = process.env.CC_WEB_LOGS_DIR || path.join(__dirname, 'logs');
 const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
-const MAX_MESSAGE_ATTACHMENTS = 4;
+const MAX_MESSAGE_ATTACHMENTS = Math.max(1, parseInt(process.env.CC_MAX_MESSAGE_ATTACHMENTS, 10) || 20);
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
 const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
@@ -2279,6 +2279,33 @@ const server = http.createServer((req, res) => {
     req.on('error', () => {
       if (!res.headersSent) jsonResponse(res, 500, { ok: false, message: '上传过程中断' });
     });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/attachments/')) {
+    const token = extractBearerToken(req) || String(url.searchParams.get('token') || '');
+    if (!isTokenValid(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+    const id = sanitizeId(url.pathname.split('/').pop() || '');
+    const meta = id ? loadAttachmentMeta(id) : null;
+    if (!meta || currentAttachmentState(meta) !== 'available') {
+      return jsonResponse(res, 404, { ok: false, message: '附件不存在或已过期' });
+    }
+    let buffer;
+    try {
+      buffer = fs.readFileSync(meta.path);
+    } catch {
+      return jsonResponse(res, 404, { ok: false, message: '附件读取失败' });
+    }
+    const disposition = url.searchParams.get('download') ? 'attachment' : 'inline';
+    res.writeHead(200, {
+      'Content-Type': meta.mime || 'application/octet-stream',
+      'Content-Length': buffer.length,
+      'Content-Disposition': `${disposition}; filename*=UTF-8''${encodeURIComponent(meta.filename || 'image')}`,
+      'Cache-Control': 'private, max-age=86400',
+    });
+    res.end(buffer);
     return;
   }
 
