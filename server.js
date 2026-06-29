@@ -2751,6 +2751,12 @@ wss.on('connection', (ws, req) => {
       case 'delete_session':
         handleDeleteSession(ws, msg.sessionId);
         break;
+      case 'truncate_session':
+        handleTruncateSession(ws, msg);
+        break;
+      case 'edit_message':
+        handleEditMessage(ws, msg);
+        break;
       case 'rename_session':
         handleRenameSession(ws, msg.sessionId, msg.title);
         break;
@@ -3762,6 +3768,447 @@ function deleteClaudeLocalSession(claudeSessionId) {
   } catch {}
 }
 
+function findClaudeSessionFile(claudeSessionId) {
+  if (!claudeSessionId) return null;
+  const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
+  try {
+    for (const proj of fs.readdirSync(projectsDir)) {
+      const target = path.join(projectsDir, proj, `${claudeSessionId}.jsonl`);
+      if (fs.existsSync(target)) return target;
+    }
+  } catch {}
+  return null;
+}
+
+// 提取一条 .jsonl 用户条目的可见文本；纯 tool_result 条目返回 null（不是人类轮次）
+function extractClaudeUserTurnText(entry) {
+  if (!entry || entry.type !== 'user') return null;
+  const raw = entry.message?.content;
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) {
+    if (raw.every((b) => b && b.type === 'tool_result')) return null;
+    return raw.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('');
+  }
+  return null;
+}
+
+// 回退截断：保留 .jsonl 中目标人类轮次「之前」的所有行，从该轮次起整体删除。
+// 切在人类轮次边界，可保证 parentUuid 链与 tool_use/tool_result 配对完整。
+// occurrence：目标内容在更早消息中重复出现的次数，用于消歧。
+function truncateClaudeContext(claudeSessionId, targetContent, occurrence) {
+  const filePath = findClaudeSessionFile(claudeSessionId);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const lines = content.split('\n');
+
+  const wantEmpty = !String(targetContent || '').trim();
+  let seen = 0;
+  let cutLineIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    let entry;
+    try { entry = JSON.parse(trimmed); } catch { continue; }
+    const text = extractClaudeUserTurnText(entry);
+    if (text === null) continue; // 非人类轮次
+    const matches = wantEmpty ? !text.trim() : text === targetContent;
+    if (!matches) continue;
+    if (seen === occurrence) { cutLineIndex = i; break; }
+    seen++;
+  }
+
+  if (cutLineIndex < 0) return { found: false };
+
+  const kept = lines.slice(0, cutLineIndex);
+  // 去掉尾部空行，保证文件以换行结尾以便 CLI 续接
+  while (kept.length && !kept[kept.length - 1].trim()) kept.pop();
+  const remainingTurns = kept.some((l) => {
+    const t = l.trim();
+    if (!t) return false;
+    try { return extractClaudeUserTurnText(JSON.parse(t)) !== null; } catch { return false; }
+  });
+
+  if (!remainingTurns) {
+    // 截断点之前已无任何人类轮次 → 等价清空，交由调用方走整会话重置
+    return { found: true, cleared: true, filePath };
+  }
+
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, kept.join('\n') + '\n');
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    return { found: false, writeError: err.message };
+  }
+  return { found: true, cleared: false, filePath };
+}
+
+// 找到某 thread 的全局 rollout 源文件（不含会话隔离副本）
+function findCodexSourceRollout(session) {
+  const threadId = session?.codexThreadId;
+  if (!threadId) return null;
+  if (session.importedRolloutPath && fs.existsSync(session.importedRolloutPath)) {
+    return session.importedRolloutPath;
+  }
+  try {
+    for (const filePath of getCodexRolloutFiles()) {
+      if (filePath.includes(threadId)) return filePath;
+    }
+  } catch {}
+  return null;
+}
+
+// 改完全局 rollout 后，删除会话隔离副本，使下次 resume 重新拷贝更新版
+function invalidateCodexSessionCopy(session) {
+  const threadId = session?.codexThreadId;
+  const homeDir = session?.codexHomeDir;
+  if (!threadId || !homeDir) return;
+  const targetSessionsDir = path.join(homeDir, 'sessions');
+  try {
+    for (const filePath of walkJsonlFiles(targetSessionsDir)) {
+      if (filePath.includes(threadId)) {
+        try { fs.unlinkSync(filePath); } catch {}
+      }
+    }
+  } catch {}
+}
+
+// 提取一条 Codex event_msg/user_message 的可见文本，否则 null
+function codexEventUserText(entry) {
+  if (!entry || entry.type !== 'event_msg') return null;
+  const p = entry.payload || {};
+  if (p.type !== 'user_message') return null;
+  const t = String(p.message || '').trim();
+  return t || null;
+}
+
+// 回退截断 Codex：在目标用户轮次的 task_started 处切，删除该行及其之后所有内容。
+// occurrence：目标内容在更早用户消息中重复出现的次数。
+function truncateCodexContext(session, targetContent, occurrence) {
+  const filePath = findCodexSourceRollout(session);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const lines = content.split('\n');
+  const parsed = lines.map((l) => { const t = l.trim(); if (!t) return null; try { return JSON.parse(t); } catch { return null; } });
+
+  // 定位目标 event_msg/user_message 行
+  const wantEmpty = !String(targetContent || '').trim();
+  let seen = 0;
+  let targetLine = -1;
+  for (let i = 0; i < parsed.length; i++) {
+    const text = codexEventUserText(parsed[i]);
+    if (text === null) continue;
+    const matches = wantEmpty ? false : text === targetContent;
+    if (!matches) continue;
+    if (seen === occurrence) { targetLine = i; break; }
+    seen++;
+  }
+  if (targetLine < 0) return { found: false };
+
+  // 从目标行往回找最近的 task_started，作为该轮起点
+  let cutLine = -1;
+  for (let i = targetLine; i >= 0; i--) {
+    const e = parsed[i];
+    if (e && e.type === 'event_msg' && e.payload?.type === 'task_started') { cutLine = i; break; }
+  }
+  if (cutLine < 0) return { found: false };
+
+  const kept = lines.slice(0, cutLine);
+  while (kept.length && !kept[kept.length - 1].trim()) kept.pop();
+
+  // 截断点之前是否仍有用户轮次
+  const remainingTurns = kept.some((l) => {
+    const t = l.trim();
+    if (!t) return false;
+    try { return codexEventUserText(JSON.parse(t)) !== null; } catch { return false; }
+  });
+  if (!remainingTurns) return { found: true, cleared: true, filePath };
+
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, kept.join('\n') + '\n');
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    return { found: false, writeError: err.message };
+  }
+  invalidateCodexSessionCopy(session);
+  return { found: true, cleared: false, filePath };
+}
+
+// 编辑 Claude 用户消息：把目标用户轮次的文本块替换为新内容，保留 uuid/parentUuid/附件块
+function editClaudeUserContext(claudeSessionId, oldContent, occurrence, newContent) {
+  const filePath = findClaudeSessionFile(claudeSessionId);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const lines = content.split('\n');
+
+  const wantEmpty = !String(oldContent || '').trim();
+  let seen = 0;
+  let targetIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    let entry;
+    try { entry = JSON.parse(trimmed); } catch { continue; }
+    const text = extractClaudeUserTurnText(entry);
+    if (text === null) continue;
+    const matches = wantEmpty ? !text.trim() : text === oldContent;
+    if (!matches) continue;
+    if (seen === occurrence) { targetIdx = i; break; }
+    seen++;
+  }
+  if (targetIdx < 0) return { found: false };
+
+  let entry;
+  try { entry = JSON.parse(lines[targetIdx].trim()); } catch { return { found: false }; }
+  const raw = entry.message?.content;
+  if (typeof raw === 'string') {
+    entry.message.content = newContent;
+  } else if (Array.isArray(raw)) {
+    let replaced = false;
+    const next = [];
+    for (const b of raw) {
+      if (b && b.type === 'text') {
+        if (!replaced) { next.push({ ...b, text: newContent }); replaced = true; }
+        // 丢弃多余 text 块，合并为一块
+      } else {
+        next.push(b);
+      }
+    }
+    if (!replaced) next.unshift({ type: 'text', text: newContent });
+    entry.message.content = next;
+  } else {
+    return { found: false };
+  }
+  lines[targetIdx] = JSON.stringify(entry);
+
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, lines.join('\n'));
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    return { found: false, writeError: err.message };
+  }
+  return { found: true };
+}
+
+// 编辑 Claude AI 回复：把第 assistantIndex 个回复轮次塌缩为单条纯文本，删除该轮工具调用/工具结果，
+// 并把后续条目重链到保留条目，保证 parentUuid 链与 tool 配对完整。
+function editClaudeAssistantContext(claudeSessionId, assistantIndex, newContent) {
+  const filePath = findClaudeSessionFile(claudeSessionId);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const lines = content.split('\n');
+  const parsed = lines.map((l) => { const t = l.trim(); if (!t) return null; try { return JSON.parse(t); } catch { return null; } });
+
+  // 找到第 assistantIndex 个「回复轮次的首个 assistant 条目」
+  let turnCount = 0;
+  let expectingNewTurn = true;
+  let keepIdx = -1;
+  for (let i = 0; i < parsed.length; i++) {
+    const e = parsed[i];
+    if (!e) continue;
+    if (extractClaudeUserTurnText(e) !== null) { expectingNewTurn = true; continue; }
+    if (e.type === 'assistant') {
+      if (expectingNewTurn) {
+        if (turnCount === assistantIndex) { keepIdx = i; break; }
+        turnCount++;
+        expectingNewTurn = false;
+      }
+    }
+  }
+  if (keepIdx < 0) return { found: false };
+
+  // 该轮结束位置：下一个用户文本条目之前
+  let nextUserTextIdx = parsed.length;
+  for (let i = keepIdx + 1; i < parsed.length; i++) {
+    const e = parsed[i];
+    if (e && extractClaudeUserTurnText(e) !== null) { nextUserTextIdx = i; break; }
+  }
+
+  const keep = parsed[keepIdx];
+  if (!keep.message) keep.message = { role: 'assistant', content: [] };
+  keep.message.content = [{ type: 'text', text: newContent }];
+  const keepUuid = keep.uuid || null;
+  lines[keepIdx] = JSON.stringify(keep);
+
+  // 删除保留条目之后、本轮范围内的所有行（工具调用、工具结果、后续 assistant 文本）
+  const deleteSet = new Set();
+  for (let i = keepIdx + 1; i < nextUserTextIdx; i++) {
+    if (lines[i].trim()) deleteSet.add(i);
+  }
+
+  // 把本轮之后的首个带 uuid 的条目重链到保留条目
+  if (keepUuid && nextUserTextIdx < parsed.length) {
+    for (let i = nextUserTextIdx; i < parsed.length; i++) {
+      const e = parsed[i];
+      if (e && e.uuid) {
+        if (Object.prototype.hasOwnProperty.call(e, 'parentUuid')) {
+          e.parentUuid = keepUuid;
+          lines[i] = JSON.stringify(e);
+        }
+        break;
+      }
+    }
+  }
+
+  const kept = lines.filter((_, i) => !deleteSet.has(i));
+
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, kept.join('\n'));
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    return { found: false, writeError: err.message };
+  }
+  return { found: true };
+}
+
+
+// 编辑 Codex 用户消息：改 event_msg/user_message 镜像 + 紧邻其前的 response_item(user) 真实上下文文本
+function editCodexUserContext(session, oldContent, occurrence, newContent) {
+  const filePath = findCodexSourceRollout(session);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const lines = content.split('\n');
+  const parsed = lines.map((l) => { const t = l.trim(); if (!t) return null; try { return JSON.parse(t); } catch { return null; } });
+
+  const wantEmpty = !String(oldContent || '').trim();
+  let seen = 0;
+  let eventIdx = -1;
+  for (let i = 0; i < parsed.length; i++) {
+    const text = codexEventUserText(parsed[i]);
+    if (text === null) continue;
+    const matches = wantEmpty ? false : text === oldContent;
+    if (!matches) continue;
+    if (seen === occurrence) { eventIdx = i; break; }
+    seen++;
+  }
+  if (eventIdx < 0) return { found: false };
+
+  // 改 event_msg 镜像
+  parsed[eventIdx].payload.message = newContent;
+  lines[eventIdx] = JSON.stringify(parsed[eventIdx]);
+
+  // 往回找紧邻的、文本等于 oldContent 的 response_item(user) 真实上下文项
+  let respIdx = -1;
+  for (let i = eventIdx - 1; i >= 0; i--) {
+    const e = parsed[i];
+    if (!e) continue;
+    const p = e.payload || {};
+    // 遇到上一轮的 task_started 即停止，避免跨轮误改
+    if (e.type === 'event_msg' && p.type === 'task_started') break;
+    if (e.type !== 'response_item' || p.type !== 'message' || p.role !== 'user') continue;
+    const txt = Array.isArray(p.content)
+      ? p.content.filter((c) => c && (c.type === 'input_text' || c.type === 'output_text')).map((c) => c.text || '').join('')
+      : '';
+    if (wantEmpty ? !txt.trim() : txt === oldContent) { respIdx = i; break; }
+  }
+  if (respIdx >= 0) {
+    const p = parsed[respIdx].payload;
+    let replaced = false;
+    const next = [];
+    for (const c of (p.content || [])) {
+      if (c && c.type === 'input_text') {
+        if (!replaced) { next.push({ ...c, text: newContent }); replaced = true; }
+      } else {
+        next.push(c);
+      }
+    }
+    if (!replaced) next.unshift({ type: 'input_text', text: newContent });
+    p.content = next;
+    lines[respIdx] = JSON.stringify(parsed[respIdx]);
+  }
+
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, lines.join('\n'));
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    return { found: false, writeError: err.message };
+  }
+  invalidateCodexSessionCopy(session);
+  return { found: true };
+}
+
+// 编辑 Codex AI 回复：把第 assistantIndex 个回复轮次的 assistant 文本塌缩为单条，
+// 删除该轮 function_call/function_call_output。Codex rollout 无 parentUuid 链，删除安全。
+function editCodexAssistantContext(session, assistantIndex, newContent) {
+  const filePath = findCodexSourceRollout(session);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const lines = content.split('\n');
+  const parsed = lines.map((l) => { const t = l.trim(); if (!t) return null; try { return JSON.parse(t); } catch { return null; } });
+
+  const isAssistantResp = (e) => e && e.type === 'response_item' && e.payload?.type === 'message' && e.payload?.role === 'assistant';
+  const isToolResp = (e) => e && e.type === 'response_item' && (e.payload?.type === 'function_call' || e.payload?.type === 'function_call_output' || e.payload?.type === 'reasoning');
+
+  // 找到第 assistantIndex 个回复轮次的首个 assistant response_item
+  let turnCount = 0;
+  let expectingNewTurn = true;
+  let keepIdx = -1;
+  for (let i = 0; i < parsed.length; i++) {
+    const e = parsed[i];
+    if (!e) continue;
+    if (codexEventUserText(e) !== null) { expectingNewTurn = true; continue; }
+    if (isAssistantResp(e)) {
+      if (expectingNewTurn) {
+        if (turnCount === assistantIndex) { keepIdx = i; break; }
+        turnCount++;
+        expectingNewTurn = false;
+      }
+    }
+  }
+  if (keepIdx < 0) return { found: false };
+
+  // 该轮结束：下一个用户消息之前
+  let nextUserIdx = parsed.length;
+  for (let i = keepIdx + 1; i < parsed.length; i++) {
+    if (codexEventUserText(parsed[i]) !== null) { nextUserIdx = i; break; }
+  }
+
+  // 保留首个 assistant 条目，替换文本
+  const keep = parsed[keepIdx];
+  keep.payload.content = [{ type: 'output_text', text: newContent }];
+  lines[keepIdx] = JSON.stringify(keep);
+
+  // 删除本轮内其余 assistant 文本块 + 工具调用/结果/思考
+  const deleteSet = new Set();
+  for (let i = keepIdx + 1; i < nextUserIdx; i++) {
+    const e = parsed[i];
+    if (isAssistantResp(e) || isToolResp(e)) deleteSet.add(i);
+  }
+  const kept = lines.filter((_, i) => !deleteSet.has(i));
+
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, kept.join('\n'));
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    return { found: false, writeError: err.message };
+  }
+  invalidateCodexSessionCopy(session);
+  return { found: true };
+}
+
 function deleteCodexLocalSession(session) {
   const threadId = session?.codexThreadId;
   if (!threadId) return { removedFiles: 0, removedDbRows: false };
@@ -3843,6 +4290,178 @@ function handleDeleteSession(ws, sessionId) {
   } catch {
     wsSend(ws, { type: 'error', message: 'Failed to delete session' });
   }
+}
+
+// 回退截断：删除目标消息及其之后的全部消息，并同步清理发送给 AI 的上下文（.jsonl）
+function handleTruncateSession(ws, msg) {
+  const { sessionId, timestamp, content } = msg || {};
+  if (!sessionId) return wsSend(ws, { type: 'error', message: '缺少 sessionId' });
+
+  if (activeProcesses.has(sessionId)) {
+    return wsSend(ws, { type: 'error', message: '会话正在生成中，无法截断，请稍后再试' });
+  }
+
+  const session = loadSession(sessionId);
+  if (!session) return wsSend(ws, { type: 'error', message: '会话不存在' });
+
+  const isCodex = getSessionAgent(session) === 'codex';
+
+  const messages = Array.isArray(session.messages) ? session.messages : [];
+  const targetContent = typeof content === 'string' ? content : '';
+  let index = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || m.role !== 'user') continue;
+    if (timestamp && m.timestamp !== timestamp) continue;
+    if ((m.content || '') !== targetContent) continue;
+    index = i;
+    break;
+  }
+  if (index < 0) {
+    return wsSend(ws, { type: 'error', message: '未找到对应消息，可能已变化，请刷新后重试' });
+  }
+
+  // 目标内容在更早用户消息中重复出现的次数，用于在上下文文件中消歧
+  let occurrence = 0;
+  for (let i = 0; i < index; i++) {
+    const m = messages[i];
+    if (m && m.role === 'user' && (m.content || '') === targetContent) occurrence++;
+  }
+
+  // 截断点之前是否仍有用户消息
+  let hasEarlierUserTurn = false;
+  for (let i = 0; i < index; i++) {
+    if (messages[i] && messages[i].role === 'user') { hasEarlierUserTurn = true; break; }
+  }
+
+  if (isCodex) {
+    if (getRuntimeSessionId(session)) {
+      if (!hasEarlierUserTurn) {
+        // 等价清空：删 rollout + sqlite 行 + 隔离副本，清掉 threadId，下次从全新会话开始
+        invalidateCodexSessionCopy(session);
+        deleteCodexLocalSession(session);
+        clearRuntimeSessionId(session);
+      } else {
+        const result = truncateCodexContext(session, targetContent, occurrence);
+        if (!result.found) {
+          return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
+        }
+        if (result.cleared) {
+          invalidateCodexSessionCopy(session);
+          deleteCodexLocalSession(session);
+          clearRuntimeSessionId(session);
+        }
+      }
+    }
+  } else if (session.claudeSessionId) {
+    if (!hasEarlierUserTurn) {
+      // 等价清空整个会话上下文：删除 .jsonl 并清掉 runtime id，下次从全新会话开始
+      deleteClaudeLocalSession(session.claudeSessionId);
+      session.claudeSessionId = null;
+    } else {
+      const result = truncateClaudeContext(session.claudeSessionId, targetContent, occurrence);
+      if (!result.found) {
+        return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
+      }
+      if (result.cleared) {
+        deleteClaudeLocalSession(session.claudeSessionId);
+        session.claudeSessionId = null;
+      }
+    }
+  }
+
+  session.messages = messages.slice(0, index);
+  session.updated = new Date().toISOString();
+  saveSession(session);
+
+  plog('INFO', 'session_truncated', {
+    sessionId: sessionId.slice(0, 8),
+    fromIndex: index,
+    removed: messages.length - index,
+  });
+
+  wsSend(ws, { type: 'session_truncated', sessionId, messages: session.messages });
+  sendSessionList(ws);
+}
+
+// 单条编辑：修改某条用户消息的文本，并同步到发送给 AI 的上下文
+function handleEditMessage(ws, msg) {
+  const { sessionId, timestamp, content, newContent } = msg || {};
+  const role = msg?.role === 'assistant' ? 'assistant' : 'user';
+  if (!sessionId) return wsSend(ws, { type: 'error', message: '缺少 sessionId' });
+
+  const next = typeof newContent === 'string' ? newContent : '';
+  if (!next.trim()) return wsSend(ws, { type: 'error', message: '编辑后的内容不能为空' });
+
+  if (activeProcesses.has(sessionId)) {
+    return wsSend(ws, { type: 'error', message: '会话正在生成中，无法编辑，请稍后再试' });
+  }
+
+  const session = loadSession(sessionId);
+  if (!session) return wsSend(ws, { type: 'error', message: '会话不存在' });
+
+  const isCodex = getSessionAgent(session) === 'codex';
+  const messages = Array.isArray(session.messages) ? session.messages : [];
+  const oldContent = typeof content === 'string' ? content : '';
+
+  // 按 时间戳 + 角色 定位（用户消息再要求内容一致，作为额外保险）
+  let index = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || m.role !== role) continue;
+    if (timestamp && m.timestamp !== timestamp) continue;
+    if (role === 'user' && (m.content || '') !== oldContent) continue;
+    index = i;
+    break;
+  }
+  if (index < 0) {
+    return wsSend(ws, { type: 'error', message: '未找到对应消息，可能已变化，请刷新后重试' });
+  }
+  if ((messages[index].content || '') === next) {
+    return wsSend(ws, { type: 'message_edited', sessionId, messages });
+  }
+
+  const runtimeId = getRuntimeSessionId(session);
+  if (runtimeId) {
+    let result;
+    if (role === 'assistant') {
+      // AI 回复按「第几个回复轮次」定位
+      let assistantIndex = 0;
+      for (let i = 0; i < index; i++) {
+        if (messages[i] && messages[i].role === 'assistant') assistantIndex++;
+      }
+      result = isCodex
+        ? editCodexAssistantContext(session, assistantIndex, next)
+        : editClaudeAssistantContext(session.claudeSessionId, assistantIndex, next);
+    } else {
+      let occurrence = 0;
+      for (let i = 0; i < index; i++) {
+        const m = messages[i];
+        if (m && m.role === 'user' && (m.content || '') === oldContent) occurrence++;
+      }
+      result = isCodex
+        ? editCodexUserContext(session, oldContent, occurrence, next)
+        : editClaudeUserContext(session.claudeSessionId, oldContent, occurrence, next);
+    }
+    if (!result.found && !result.fileMissing) {
+      return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
+    }
+  }
+
+  const editedMsg = { ...messages[index], content: next };
+  if (role === 'assistant') {
+    // 工具调用流程已随上下文删除，展示也同步去掉
+    delete editedMsg.toolCalls;
+  }
+  messages[index] = editedMsg;
+  session.messages = messages;
+  session.updated = new Date().toISOString();
+  saveSession(session);
+
+  plog('INFO', 'message_edited', { sessionId: sessionId.slice(0, 8), index, role });
+
+  wsSend(ws, { type: 'message_edited', sessionId, messages: session.messages });
+  sendSessionList(ws);
 }
 
 function handleRenameSession(ws, sessionId, title) {

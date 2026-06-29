@@ -1269,9 +1269,15 @@ body.session-loading-active {
   -webkit-user-select: text;
   -webkit-touch-callout: default;
 }
+.msg-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
 .msg-copy-btn {
   display: block;
-  margin: 8px 0 0 auto;
   padding: 3px 8px;
   border: 1px solid var(--border-color);
   border-radius: 999px;
@@ -1302,8 +1308,130 @@ body.session-loading-active {
   background: rgba(255, 255, 255, 0.28);
   color: #fff;
 }
+.msg-truncate-btn {
+  display: block;
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+.msg-bubble:hover .msg-truncate-btn,
+.msg-truncate-btn:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.msg-truncate-btn:hover {
+  background: var(--danger-color, #d64545);
+  border-color: var(--danger-color, #d64545);
+  color: #fff;
+}
+.msg.user .msg-truncate-btn {
+  border-color: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.92);
+}
+.msg.user .msg-truncate-btn:hover {
+  background: rgba(214, 69, 69, 0.85);
+  border-color: rgba(214, 69, 69, 0.85);
+  color: #fff;
+}
+.msg-edit-btn {
+  display: block;
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+.msg-bubble:hover .msg-edit-btn,
+.msg-edit-btn:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.msg-edit-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+.msg.user .msg-edit-btn {
+  border-color: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.92);
+}
+.msg.user .msg-edit-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+  color: #fff;
+}
+.msg-edit-box {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.msg-edit-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 60px;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.msg.user .msg-edit-input {
+  background: rgba(255, 255, 255, 0.96);
+  color: #1f2937;
+  border-color: rgba(255, 255, 255, 0.4);
+}
+.msg-edit-row {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+.msg-edit-hint {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+  opacity: 0.85;
+}
+.msg-edit-save,
+.msg-edit-cancel {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-edit-save {
+  background: var(--accent-color, #2563eb);
+  border-color: var(--accent-color, #2563eb);
+  color: #fff;
+}
+.msg-edit-cancel {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
 @media (pointer: coarse) {
-  .msg-copy-btn {
+  .msg-copy-btn,
+  .msg-truncate-btn,
+  .msg-edit-btn {
     opacity: 1;
     transform: none;
     min-width: 44px;

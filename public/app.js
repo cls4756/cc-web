@@ -2761,6 +2761,38 @@
         renderSessionList();
         break;
 
+      case 'session_truncated': {
+        const truncatedMessages = Array.isArray(msg.messages) ? msg.messages : [];
+        updateCachedSession(msg.sessionId, (snapshot) => {
+          snapshot.messages = cloneMessages(truncatedMessages);
+          snapshot.complete = true;
+          snapshot.historyPending = false;
+        });
+        if (msg.sessionId === currentSessionId) {
+          clearHistoryChunkQueue();
+          loadedHistorySessionId = currentSessionId;
+          renderMessages(truncatedMessages, { immediate: true });
+          showToast('已清除该消息及其之后的内容');
+        }
+        break;
+      }
+
+      case 'message_edited': {
+        const editedMessages = Array.isArray(msg.messages) ? msg.messages : [];
+        updateCachedSession(msg.sessionId, (snapshot) => {
+          snapshot.messages = cloneMessages(editedMessages);
+          snapshot.complete = true;
+          snapshot.historyPending = false;
+        });
+        if (msg.sessionId === currentSessionId) {
+          clearHistoryChunkQueue();
+          loadedHistorySessionId = currentSessionId;
+          renderMessages(editedMessages, { immediate: true, preserveScroll: true });
+          showToast('已更新该消息及 AI 上下文');
+        }
+        break;
+      }
+
       case 'text_delta':
         if (!isGenerating) startGenerating();
         pendingText += msg.text;
@@ -3069,7 +3101,7 @@
 
   function getMessageCopyText(bubble) {
     const clone = bubble.cloneNode(true);
-    clone.querySelectorAll('.msg-copy-btn, .code-block-header, .code-preview-pane, .typing-indicator').forEach((node) => node.remove());
+    clone.querySelectorAll('.msg-actions, .msg-edit-box, .msg-copy-btn, .code-block-header, .code-preview-pane, .typing-indicator').forEach((node) => node.remove());
     return clone.innerText.replace(/\n{3,}/g, '\n\n').trim();
   }
 
@@ -3092,8 +3124,19 @@
     return ok;
   }
 
+  function getMsgActions(bubble) {
+    let actions = bubble.querySelector(':scope > .msg-actions');
+    if (!actions) {
+      actions = document.createElement('div');
+      actions.className = 'msg-actions';
+      bubble.appendChild(actions);
+    }
+    return actions;
+  }
+
   function addMessageCopyButton(bubble) {
-    if (bubble.querySelector(':scope > .msg-copy-btn')) return;
+    const actions = getMsgActions(bubble);
+    if (actions.querySelector(':scope > .msg-copy-btn')) return;
     const btn = document.createElement('button');
     btn.className = 'msg-copy-btn';
     btn.type = 'button';
@@ -3114,7 +3157,135 @@
         showToast('复制失败，请手动选择文本');
       }
     });
-    bubble.appendChild(btn);
+    actions.appendChild(btn);
+  }
+
+  function addMessageTruncateButton(bubble, message) {
+    const actions = getMsgActions(bubble);
+    if (actions.querySelector(':scope > .msg-truncate-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'msg-truncate-btn';
+    btn.type = 'button';
+    btn.title = '删除这条及其之后的所有消息，并同步清理 AI 上下文以节省 token';
+    btn.setAttribute('aria-label', '从这里清除');
+    btn.textContent = '从这里清除';
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!currentSessionId) return;
+      if (!confirm('将删除这条消息及其之后的所有消息，并同步清理发送给 AI 的上下文（用于节省 token）。此操作不可撤销，确定继续吗？')) return;
+      send({
+        type: 'truncate_session',
+        sessionId: currentSessionId,
+        timestamp: message.timestamp || null,
+        content: message.content || '',
+      });
+    });
+    actions.appendChild(btn);
+  }
+
+  function addMessageEditButton(bubble, message) {
+    const actions = getMsgActions(bubble);
+    if (actions.querySelector(':scope > .msg-edit-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'msg-edit-btn';
+    btn.type = 'button';
+    btn.title = '编辑这条消息内容，并同步到发送给 AI 的上下文';
+    btn.setAttribute('aria-label', '编辑');
+    btn.textContent = '编辑';
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      startMessageEdit(bubble, message);
+    });
+    actions.appendChild(btn);
+  }
+
+  function startMessageEdit(bubble, message) {
+    if (bubble.querySelector(':scope > .msg-edit-box')) return;
+    const isAssistant = message.role === 'assistant';
+    const textNode = bubble.querySelector(':scope > .msg-text');
+    const original = message.content || (textNode ? textNode.textContent : '') || '';
+
+    // 编辑时隐藏原内容：用户消息只有 .msg-text；AI 消息是渲染后的 Markdown + 工具调用，隐藏全部直接子元素
+    const hidden = [];
+    if (isAssistant) {
+      for (const child of Array.from(bubble.children)) {
+        if (child.classList && child.classList.contains('msg-actions')) continue;
+        if (child.style.display !== 'none') { hidden.push(child); child.style.display = 'none'; }
+      }
+    } else if (textNode) {
+      textNode.style.display = 'none';
+      hidden.push(textNode);
+    }
+
+    const box = document.createElement('div');
+    box.className = 'msg-edit-box';
+    const ta = document.createElement('textarea');
+    ta.className = 'msg-edit-input';
+    ta.value = original;
+    const row = document.createElement('div');
+    row.className = 'msg-edit-row';
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'msg-edit-save';
+    saveBtn.textContent = '保存';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'msg-edit-cancel';
+    cancelBtn.textContent = '取消';
+    if (isAssistant) {
+      const hint = document.createElement('span');
+      hint.className = 'msg-edit-hint';
+      hint.textContent = '保存将删除本轮的工具调用记录';
+      row.appendChild(hint);
+    }
+    row.appendChild(saveBtn);
+    row.appendChild(cancelBtn);
+    box.appendChild(ta);
+    box.appendChild(row);
+
+    const actions = bubble.querySelector(':scope > .msg-actions');
+    if (actions) actions.style.display = 'none';
+    bubble.insertBefore(box, actions || null);
+
+    const autoGrow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 320) + 'px'; };
+    autoGrow();
+    ta.addEventListener('input', autoGrow);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+
+    const cleanup = () => {
+      box.remove();
+      hidden.forEach((node) => { node.style.display = ''; });
+      if (actions) actions.style.display = '';
+    };
+    cancelBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); cleanup(); });
+    saveBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const next = ta.value;
+      if (!next.trim()) { showToast('内容不能为空'); return; }
+      if (next === original) { cleanup(); return; }
+      if (!currentSessionId) return;
+      const confirmMsg = isAssistant
+        ? '将修改这条 AI 回复并同步更新上下文，本轮的工具调用记录会被删除。确定保存吗？'
+        : '将修改这条消息，并同步更新发送给 AI 的上下文。确定保存吗？';
+      if (!confirm(confirmMsg)) return;
+      send({
+        type: 'edit_message',
+        sessionId: currentSessionId,
+        role: message.role || 'user',
+        timestamp: message.timestamp || null,
+        content: original,
+        newContent: next,
+      });
+      cleanup();
+    });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); cleanup(); }
+      else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); saveBtn.click(); }
+    });
   }
 
   function createMsgElement(role, content, attachments = []) {
@@ -3256,6 +3427,13 @@
 
 	  function buildMsgElement(m) {
 	    const el = createMsgElement(m.role, m.content, m.attachments || []);
+	    if (m.role === 'user' && m.timestamp) {
+	      const bubble = el.querySelector('.msg-bubble');
+	      if (bubble) {
+	        addMessageEditButton(bubble, m);
+	        addMessageTruncateButton(bubble, m);
+	      }
+	    }
 	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
 	      const bubble = el.querySelector('.msg-bubble');
 	      const FOLD_AT = 3;
@@ -3297,6 +3475,10 @@
           }
         }
       }
+    }
+    if (m.role === 'assistant' && m.timestamp) {
+      const bubble = el.querySelector('.msg-bubble');
+      if (bubble) addMessageEditButton(bubble, m);
     }
     return el;
   }
