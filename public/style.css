@@ -1374,6 +1374,38 @@ body.session-loading-active {
   background: rgba(255, 255, 255, 0.28);
   color: #fff;
 }
+.msg-resend-btn {
+  display: block;
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+.msg-bubble:hover .msg-resend-btn,
+.msg-resend-btn:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.msg-resend-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+.msg.user .msg-resend-btn {
+  border-color: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.92);
+}
+.msg.user .msg-resend-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+  color: #fff;
+}
 .msg-edit-box {
   margin-top: 8px;
   display: flex;
@@ -1431,7 +1463,8 @@ body.session-loading-active {
 @media (pointer: coarse) {
   .msg-copy-btn,
   .msg-truncate-btn,
-  .msg-edit-btn {
+  .msg-edit-btn,
+  .msg-resend-btn {
     opacity: 1;
     transform: none;
     min-width: 44px;

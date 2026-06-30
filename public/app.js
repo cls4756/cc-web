@@ -127,6 +127,8 @@
   // 单条消息最多附带的图片数量。后端默认同样为 20，可用环境变量 CC_MAX_MESSAGE_ATTACHMENTS 调整；
   // 后端会对超量部分做兜底截断，这里仅用于前端提示。
   const MAX_MESSAGE_ATTACHMENTS = 20;
+  // 待处理的「重新发送」：先截断到目标消息，收到 session_truncated 后再把该文本重发一次。
+  let pendingResend = null;
   let loginPasswordValue = ''; // store login password for force-change flow
   let isRootOrSudo = false;
   let currentCwd = null;
@@ -2789,11 +2791,17 @@
           snapshot.complete = true;
           snapshot.historyPending = false;
         });
+        const resend = (pendingResend && pendingResend.sessionId === msg.sessionId) ? pendingResend : null;
+        pendingResend = null;
         if (msg.sessionId === currentSessionId) {
           clearHistoryChunkQueue();
           loadedHistorySessionId = currentSessionId;
           renderMessages(truncatedMessages, { immediate: true });
-          showToast('已清除该消息及其之后的内容');
+          if (resend) {
+            dispatchMessage(resend.text, resend.attachments || []);
+          } else {
+            showToast('已清除该消息及其之后的内容');
+          }
         }
         break;
       }
@@ -2916,6 +2924,7 @@
         break;
 
       case 'error':
+        pendingResend = null;
         appendError(msg.message);
         clearSessionLoading();
         if (!isGenerating && currentSessionId) {
@@ -3205,6 +3214,44 @@
     actions.appendChild(btn);
   }
 
+  function addMessageResendButton(bubble, message) {
+    const actions = getMsgActions(bubble);
+    if (actions.querySelector(':scope > .msg-resend-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'msg-resend-btn';
+    btn.type = 'button';
+    btn.title = '删除这条及其之后的所有消息，然后用这条消息的内容重新发送一次';
+    btn.setAttribute('aria-label', '重新发送');
+    btn.textContent = '重新发送';
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!currentSessionId) return;
+      if (isGenerating) {
+        appendError('正在生成中，请先停止后再重新发送。');
+        return;
+      }
+      const text = message.content || '';
+      const attachments = Array.isArray(message.attachments)
+        ? message.attachments.map((attachment) => ({ ...attachment }))
+        : [];
+      if (!text.trim() && attachments.length === 0) {
+        appendError('该消息没有可重新发送的内容。');
+        return;
+      }
+      if (!confirm('将删除这条消息及其之后的所有消息（并同步清理 AI 上下文），然后用这条消息的内容重新发送一次。确定继续吗？')) return;
+      // 记录重发意图：截断成功后在 session_truncated 处理里触发重发
+      pendingResend = { sessionId: currentSessionId, text, attachments };
+      send({
+        type: 'truncate_session',
+        sessionId: currentSessionId,
+        timestamp: message.timestamp || null,
+        content: message.content || '',
+      });
+    });
+    actions.appendChild(btn);
+  }
+
   function addMessageEditButton(bubble, message) {
     const actions = getMsgActions(bubble);
     if (actions.querySelector(':scope > .msg-edit-btn')) return;
@@ -3453,6 +3500,7 @@
 	      if (bubble) {
 	        addMessageEditButton(bubble, m);
 	        addMessageTruncateButton(bubble, m);
+	        addMessageResendButton(bubble, m);
 	      }
 	    }
 	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
@@ -4484,17 +4532,21 @@
     }
 
     // Regular message
-    const welcome = messagesDiv.querySelector('.welcome-msg');
-    if (welcome) welcome.remove();
     const attachments = pendingAttachments.map((attachment) => ({ ...attachment }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments));
-    scrollToBottom();
-
-    send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+    dispatchMessage(text, attachments);
     msgInput.value = '';
     pendingAttachments = [];
     renderPendingAttachments();
     autoResize();
+  }
+
+  // 把一条用户消息乐观插入界面并发往后端、进入生成态。供普通发送与「重新发送」共用。
+  function dispatchMessage(text, attachments = []) {
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+    messagesDiv.appendChild(createMsgElement('user', text, attachments));
+    scrollToBottom();
+    send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     startGenerating();
   }
 
