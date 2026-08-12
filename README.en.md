@@ -26,6 +26,7 @@ A lightweight browser interface for Claude Code and Codex, designed to keep each
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
 - **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
+- **Per-profile proxy**: each Claude template and Codex profile can independently use a HTTP, HTTPS, or SOCKS proxy.
 - **Developer config**: save SSH host info (key/password auth) and GitHub tokens for quick remote host management and repository operations via `/ssh` and `/github` commands.
 - **Password-based auth**: initial password generation, forced first-login reset, and password change in Web UI.
 

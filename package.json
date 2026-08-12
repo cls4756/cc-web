@@ -4,11 +4,13 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "regression": "node scripts/regression.js"
+    "regression": "node scripts/regression.js",
+    "test:codex-appserver": "node scripts/codex-appserver-unit.js"
   },
   "dependencies": {
     "@highlightjs/cdn-assets": "^11.9.0",
     "marked": "^12.0.1",
+    "proxy-agent": "^6.5.0",
     "ws": "^8.18.0"
   }
 }

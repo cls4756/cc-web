@@ -1,109 +1,216 @@
 #!/usr/bin/env node
 
+// Mock `codex app-server`: speaks the JSON-RPC subset that lib/codex-appserver.js drives.
+// Every frame received from cc-web is appended to $CODEX_HOME/frames.jsonl so the
+// regression suite can assert on what actually reached Codex (sandbox, approval policy,
+// resumed thread id, model, image input) instead of on process argv.
+
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-function readStdin() {
-  return new Promise((resolve) => {
-    let data = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => { data += chunk; });
-    process.stdin.on('end', () => resolve(data));
-  });
+const FRAME_LOG = process.env.CODEX_HOME
+  ? path.join(process.env.CODEX_HOME, 'frames.jsonl')
+  : null;
+
+function recordFrame(frame) {
+  if (!FRAME_LOG) return;
+  try {
+    fs.mkdirSync(path.dirname(FRAME_LOG), { recursive: true });
+    fs.appendFileSync(FRAME_LOG, `${JSON.stringify(frame)}\n`);
+  } catch {}
 }
 
-(async function main() {
-  const args = process.argv.slice(2);
-  // cc-web can place `resume` after other `codex exec` options (e.g. --json, -s).
-  const isResume = args[0] === 'exec' && args.includes('resume');
-  const threadId = (() => {
-    if (!isResume) return `mock-${crypto.randomUUID()}`;
-    for (let i = args.length - 1; i >= 2; i--) {
-      const arg = args[i];
-      if (arg === '-' || String(arg).startsWith('-')) continue;
-      return arg;
-    }
-    return `mock-${crypto.randomUUID()}`;
-  })();
-  const input = (await readStdin()).trim();
-  const imageCount = args.filter((arg) => arg === '--image').length;
-  const statePath = path.join(os.tmpdir(), `cc-web-mock-codex-${threadId}.json`);
-  let state = {};
+function send(obj) {
+  process.stdout.write(`${JSON.stringify(obj)}\n`);
+}
+
+function respond(id, result) {
+  send({ jsonrpc: '2.0', id, result });
+}
+
+function notify(method, params) {
+  send({ jsonrpc: '2.0', method, params });
+}
+
+const state = {
+  threadId: null,
+  cwd: process.cwd(),
+  turnSeq: 0,
+};
+
+function statePath(threadId) {
+  return path.join(os.tmpdir(), `cc-web-mock-codex-${threadId}.json`);
+}
+
+function loadThreadState() {
   try {
-    state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    return JSON.parse(fs.readFileSync(statePath(state.threadId), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveThreadState(next) {
+  try {
+    fs.writeFileSync(statePath(state.threadId), JSON.stringify(next));
   } catch {}
+}
 
-  process.stdout.write(`${JSON.stringify({ type: 'thread.started', thread_id: threadId })}\n`);
-  process.stdout.write(`${JSON.stringify({ type: 'turn.started' })}\n`);
+function threadSnapshot() {
+  return {
+    id: state.threadId,
+    cwd: state.cwd,
+    preview: '',
+    status: { type: 'idle' },
+    cliVersion: 'mock-0.0.0',
+  };
+}
 
-  if (/pwd/i.test(input)) {
-    process.stdout.write(`${JSON.stringify({
-      type: 'item.started',
-      item: {
-        id: 'item_cmd',
-        type: 'command_execution',
-        command: '/bin/bash -lc pwd',
-        aggregated_output: '',
-        exit_code: null,
-        status: 'in_progress',
-      },
-    })}\n`);
-    process.stdout.write(`${JSON.stringify({
-      type: 'item.completed',
-      item: {
-        id: 'item_cmd',
-        type: 'command_execution',
-        command: '/bin/bash -lc pwd',
-        aggregated_output: '/tmp/mock-codex\n',
-        exit_code: 0,
-        status: 'completed',
-      },
-    })}\n`);
+function appendRollout(entry) {
+  if (!process.env.CODEX_HOME || !state.threadId) return;
+  try {
+    const dir = path.join(process.env.CODEX_HOME, 'sessions', 'mock');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, `rollout-${state.threadId}.jsonl`), `${JSON.stringify(entry)}\n`);
+  } catch {}
+}
+
+function runTurn(id, params) {
+  const input = Array.isArray(params.input) ? params.input : [];
+  const text = input.filter((i) => i && i.type === 'text').map((i) => i.text || '').join('').trim();
+  const imageCount = input.filter((i) => i && i.type === 'localImage').length;
+
+  const turnId = `turn-${++state.turnSeq}`;
+  const timestamp = new Date().toISOString();
+  appendRollout({ timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } });
+  appendRollout({ timestamp, type: 'event_msg', payload: { type: 'user_message', message: text } });
+  respond(id, { turn: { id: turnId, status: 'inProgress' } });
+
+  const threadState = loadThreadState();
+  const isInitPrompt = text === '/init' || text.includes("You are running cc-web's /init for a Codex session.");
+
+  if (/pwd/i.test(text)) {
+    const item = {
+      id: 'item_cmd',
+      type: 'commandExecution',
+      command: '/bin/bash -lc pwd',
+      status: 'inProgress',
+    };
+    notify('item/started', { item });
+    notify('item/completed', {
+      item: { ...item, status: 'completed', exitCode: 0, aggregatedOutput: `${state.cwd}\n` },
+    });
   }
-
-  if (input === '/compact') {
-    state.compacted = true;
-    fs.writeFileSync(statePath, JSON.stringify(state));
-  }
-
-  const isInitPrompt = input === '/init' || input.includes('You are running cc-web\'s /init for a Codex session.');
 
   if (isInitPrompt) {
-    const agentsPath = path.join(process.cwd(), 'AGENTS.md');
-    fs.writeFileSync(agentsPath, '# AGENTS.md\n\nGenerated by mock Codex /init.\n');
+    try {
+      fs.writeFileSync(path.join(state.cwd, 'AGENTS.md'), '# AGENTS.md\n\nGenerated by mock Codex /init.\n');
+    } catch {}
   }
 
-  if (input === 'trigger codex context limit' && !state.compacted) {
-    process.stdout.write(`${JSON.stringify({
-      type: 'turn.failed',
-      error: { message: 'Context window exceeded. Please use /compact and retry.' },
-    })}\n`);
-    process.exit(1);
+  if (text === '/compact') {
+    saveThreadState({ ...threadState, compacted: true });
   }
 
-  const responseText = input === '/compact'
+  // First attempt overflows the context window; after a /compact the retry succeeds.
+  if (text === 'trigger codex context limit' && !threadState.compacted) {
+    notify('turn/completed', {
+      threadId: state.threadId,
+      turn: {
+        id: turnId,
+        status: 'failed',
+        error: { message: 'Context window exceeded. Please use /compact and retry.' },
+      },
+    });
+    return;
+  }
+
+  if (text === 'trigger codex context limit' && threadState.compacted) {
+    try { fs.unlinkSync(statePath(state.threadId)); } catch {}
+  }
+
+  const responseText = text === '/compact'
     ? 'Codex compact finished.'
     : isInitPrompt
       ? 'Codex init finished.'
-    : `Codex mock handled (${imageCount} image): ${input}`;
+      : `Codex mock handled (${imageCount} image): ${text}`;
 
-  process.stdout.write(`${JSON.stringify({
-    type: 'item.completed',
-    item: {
-      id: 'item_msg',
-      type: 'agent_message',
-      text: responseText,
-    },
-  })}\n`);
+  notify('item/completed', {
+    item: { id: `item_msg_${turnId}`, type: 'agentMessage', text: responseText },
+  });
 
-  if (input === 'trigger codex context limit' && state.compacted) {
-    try { fs.unlinkSync(statePath); } catch {}
+  notify('thread/tokenUsage/updated', {
+    threadId: state.threadId,
+    tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 5 } },
+  });
+
+  notify('turn/completed', {
+    threadId: state.threadId,
+    turn: { id: turnId, status: 'completed' },
+  });
+}
+
+function handleFrame(frame) {
+  recordFrame(frame);
+
+  // Responses to our own server->client requests: nothing to drive here.
+  if (frame.method === undefined) return;
+
+  const { id, method, params = {} } = frame;
+
+  switch (method) {
+    case 'initialize':
+      respond(id, { userAgent: 'mock-codex/0.0.0', codexHome: process.env.CODEX_HOME || '', platformOs: 'linux' });
+      return;
+
+    case 'initialized':
+      return;
+
+    case 'thread/start':
+      state.threadId = `mock-${crypto.randomUUID()}`;
+      if (params.cwd) state.cwd = params.cwd;
+      respond(id, { thread: threadSnapshot() });
+      notify('thread/started', { thread: threadSnapshot() });
+      return;
+
+    case 'thread/resume':
+      state.threadId = params.threadId || `mock-${crypto.randomUUID()}`;
+      if (params.cwd) state.cwd = params.cwd;
+      respond(id, { thread: threadSnapshot() });
+      return;
+
+    case 'thread/rollback':
+      state.threadId = params.threadId || state.threadId;
+      respond(id, { thread: { ...threadSnapshot(), turns: [] } });
+      return;
+
+    case 'turn/start':
+      runTurn(id, params);
+      return;
+
+    default:
+      if (id !== undefined) respond(id, {});
   }
+}
 
-  process.stdout.write(`${JSON.stringify({
-    type: 'turn.completed',
-    usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 5 },
-  })}\n`);
-})();
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    let frame;
+    try { frame = JSON.parse(line); } catch { continue; }
+    try { handleFrame(frame); } catch (err) {
+      process.stderr.write(`mock-codex error: ${err.message}\n`);
+    }
+  }
+});
+
+// The app-server stays alive until cc-web kills it after the turn completes.
+process.stdin.on('end', () => process.exit(0));

@@ -29,6 +29,7 @@ https://github.com/ZgDaniel/cc-web 给我装！
 - **本地历史导入** — Claude 可导入 `~/.claude/projects/` 会话；Codex 可导入 `~/.codex/sessions/` rollout 历史
 - **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知，支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg）
 - **多 API 切换** — 可配置多个 API 方案，一键切换，即时生效
+- **按 API 配置代理** — Claude 模板和 Codex Profile 可独立选择直连或 HTTP / HTTPS / SOCKS 代理
 - **开发者配置** — 可保存主机SSH信息、github token，实现快速管理远程主机、管理github仓库
 
 ## 前提条件

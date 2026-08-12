@@ -2365,6 +2365,8 @@
 	      name: String(profile?.name || '').trim(),
 	      apiKey: String(profile?.apiKey || ''),
 	      apiBase: String(profile?.apiBase || '').trim(),
+	      useProxy: !!profile?.useProxy,
+	      proxyUrl: String(profile?.proxyUrl || '').trim(),
 	      model: String(profile?.model || '').trim(),
 	      models: [],
 	    };
@@ -2862,11 +2864,15 @@
         break;
 
       case 'done':
-        finishGenerating(msg.sessionId);
+        finishGenerating(msg.sessionId, msg.timestamp);
         break;
 
       case 'system_message':
         appendSystemMessage(msg.message);
+        break;
+
+      case 'codex_approval_request':
+        showCodexApprovalModal(msg);
         break;
 
       case 'mode_changed':
@@ -3054,7 +3060,7 @@
     if (shouldFollowOutput) scrollToBottom();
   }
 
-  function finishGenerating(sessionId) {
+  function finishGenerating(sessionId, timestamp = null) {
     isGenerating = false;
     sendBtn.hidden = false;
     abortBtn.hidden = true;
@@ -3092,6 +3098,7 @@
           }
         }
       }
+      addMessageTimestamp(streamEl, timestamp || new Date().toISOString());
       streamEl.removeAttribute('id');
     }
 
@@ -3356,7 +3363,37 @@
     });
   }
 
-  function createMsgElement(role, content, attachments = []) {
+  function formatMessageTimestamp(timestamp) {
+    if (!timestamp) return '';
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+  }
+
+  function addMessageTimestamp(messageElement, timestamp) {
+    if (!messageElement || messageElement.classList.contains('system')) return;
+    const text = formatMessageTimestamp(timestamp);
+    if (!text) return;
+    const content = messageElement.querySelector(':scope > .msg-content');
+    if (!content) return;
+    let time = content.querySelector(':scope > .msg-time');
+    if (!time) {
+      time = document.createElement('time');
+      time.className = 'msg-time';
+      content.appendChild(time);
+    }
+    time.dateTime = timestamp;
+    time.textContent = text;
+  }
+
+  function createMsgElement(role, content, attachments = [], timestamp = null) {
     const div = document.createElement('div');
     div.className = `msg ${role}${role === 'assistant' ? ' agent-' + currentAgent : ''}`;
 
@@ -3399,8 +3436,13 @@
       }
     }
 
+    const messageContent = document.createElement('div');
+    messageContent.className = 'msg-content';
+    messageContent.appendChild(bubble);
+
     div.appendChild(avatar);
-    div.appendChild(bubble);
+    div.appendChild(messageContent);
+    addMessageTimestamp(div, timestamp);
     addMessageCopyButton(bubble);
     return div;
   }
@@ -3494,7 +3536,7 @@
   }
 
 	  function buildMsgElement(m) {
-	    const el = createMsgElement(m.role, m.content, m.attachments || []);
+	    const el = createMsgElement(m.role, m.content, m.attachments || [], m.timestamp || null);
 	    if (m.role === 'user' && m.timestamp) {
 	      const bubble = el.querySelector('.msg-bubble');
 	      if (bubble) {
@@ -3666,6 +3708,93 @@
     msgInput.value = current ? `${current}\n${line}` : line;
     autoResize();
     msgInput.focus();
+  }
+
+  // Codex out-of-workspace approval prompt. Codex only asks when an action escapes the
+  // project directory, so any request here means the user must consciously allow it.
+  let activeApprovalOverlay = null;
+  const approvalQueue = [];
+  function showCodexApprovalModal(msg) {
+    // Codex can have several approvals in flight at once. Queue them: replacing the
+    // overlay would drop the earlier request without a reply and hang that turn.
+    approvalQueue.push(msg);
+    if (!activeApprovalOverlay) renderNextApproval();
+  }
+
+  function renderNextApproval() {
+    const msg = approvalQueue.shift();
+    if (!msg) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'approval-overlay';
+    activeApprovalOverlay = overlay;
+
+    const modal = document.createElement('div');
+    modal.className = 'approval-modal';
+
+    const title = document.createElement('div');
+    title.className = 'approval-title';
+    title.textContent = `⚠ ${msg.title || '需要确认的操作'}`;
+    modal.appendChild(title);
+
+    const desc = document.createElement('div');
+    desc.className = 'approval-desc';
+    desc.textContent = msg.reason || 'Codex 请求执行一个需要你确认的操作。';
+    modal.appendChild(desc);
+
+    if (msg.cwd) {
+      const cwdRow = document.createElement('div');
+      cwdRow.className = 'approval-meta';
+      cwdRow.textContent = `项目目录：${msg.cwd}`;
+      modal.appendChild(cwdRow);
+    }
+
+    if (msg.command) {
+      const cmd = document.createElement('pre');
+      cmd.className = 'approval-command';
+      cmd.textContent = msg.command;
+      modal.appendChild(cmd);
+    }
+
+    if (Array.isArray(msg.paths) && msg.paths.length > 0) {
+      const pathsWrap = document.createElement('div');
+      pathsWrap.className = 'approval-paths';
+      pathsWrap.textContent = `涉及路径：${msg.paths.join('  ·  ')}`;
+      modal.appendChild(pathsWrap);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'approval-actions';
+
+    let answered = false;
+    const respond = (decision) => {
+      if (answered) return;
+      answered = true;
+      send({ type: 'approval_response', sessionId: msg.sessionId, approvalId: msg.approvalId, decision });
+      overlay.remove();
+      if (activeApprovalOverlay === overlay) activeApprovalOverlay = null;
+      renderNextApproval();
+    };
+
+    const denyBtn = document.createElement('button');
+    denyBtn.type = 'button';
+    denyBtn.className = 'approval-btn approval-deny';
+    denyBtn.textContent = '拒绝';
+    denyBtn.addEventListener('click', () => respond('deny'));
+
+    const allowBtn = document.createElement('button');
+    allowBtn.type = 'button';
+    allowBtn.className = 'approval-btn approval-allow';
+    allowBtn.textContent = '允许本次';
+    allowBtn.addEventListener('click', () => respond('approve'));
+
+    actions.appendChild(denyBtn);
+    actions.appendChild(allowBtn);
+    modal.appendChild(actions);
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    allowBtn.focus();
   }
 
   function createAskUserQuestionView(questions) {
@@ -4544,9 +4673,11 @@
   function dispatchMessage(text, attachments = []) {
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
-    messagesDiv.appendChild(createMsgElement('user', text, attachments));
+    const timestamp = new Date().toISOString();
+    const message = { role: 'user', content: text, attachments, timestamp };
+    messagesDiv.appendChild(buildMsgElement(message));
     scrollToBottom();
-    send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+    send({ type: 'message', text, attachments, timestamp, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     startGenerating();
   }
 
@@ -5144,6 +5275,20 @@
       modelStatusDiv.className = 'settings-status ' + (type || '');
     }
 
+    function validateProxyDraft(useProxy, proxyUrl) {
+      if (!useProxy) return '';
+      if (!proxyUrl) return '启用代理时请填写代理地址';
+      try {
+        const parsed = new URL(proxyUrl);
+        if (!['http:', 'https:', 'socks:', 'socks4:', 'socks4a:', 'socks5:', 'socks5h:'].includes(parsed.protocol)) {
+          return `不支持的代理协议：${parsed.protocol}`;
+        }
+      } catch {
+        return '代理地址格式无效';
+      }
+      return '';
+    }
+
     function renderClaudeConfigArea() {
       const isLocal = modelActiveTemplate === '';
       const tplOptions = modelEditingTemplates.map(t =>
@@ -5177,7 +5322,7 @@
             if (!newName || !newName.trim()) { e.target.value = '__local__'; return; }
             const n = newName.trim();
             if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = '__local__'; return; }
-            modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
+            modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', useProxy: false, proxyUrl: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
             modelActiveTemplate = n;
             renderClaudeConfigArea();
             openTplEditModal();
@@ -5195,7 +5340,7 @@
 
       // Custom template selected
       const tpl = modelEditingTemplates.find(t => t.name === modelActiveTemplate);
-      const summary = tpl ? `API Key: <code>${tpl.apiKey ? '已设置' : '未设置'}</code> · Base: <code>${escapeHtml(tpl.apiBase || '默认')}</code>` : '';
+      const summary = tpl ? `API Key: <code>${tpl.apiKey ? '已设置' : '未设置'}</code> · Base: <code>${escapeHtml(tpl.apiBase || '默认')}</code> · 代理：<code>${tpl.useProxy ? escapeHtml(tpl.proxyUrl || '未填写') : '关闭'}</code>` : '';
       claudeConfigArea.innerHTML = `
         <div class="settings-field">
           <label>激活模板</label>
@@ -5218,7 +5363,7 @@
           if (!newName || !newName.trim()) { e.target.value = escapeHtml(modelActiveTemplate); return; }
           const n = newName.trim();
           if (modelEditingTemplates.find(t => t.name === n)) { alert('模板名称已存在'); e.target.value = escapeHtml(modelActiveTemplate); return; }
-          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
+          modelEditingTemplates.push({ name: n, apiKey: '', apiBase: '', useProxy: false, proxyUrl: '', defaultModel: '', opusModel: '', sonnetModel: '', haikuModel: '' });
           modelActiveTemplate = n;
           renderClaudeConfigArea();
           openTplEditModal();
@@ -5269,6 +5414,13 @@
           <label>API Base URL</label>
           <input type="text" id="tpl-ed-apibase" placeholder="https://api.anthropic.com" value="${escapeHtml(tpl.apiBase || '')}">
         </div>
+        <div class="settings-field">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="tpl-ed-use-proxy"${tpl.useProxy ? ' checked' : ''}> 使用代理
+          </label>
+          <input type="text" id="tpl-ed-proxy-url" placeholder="http://127.0.0.1:7890" value="${escapeHtml(tpl.proxyUrl || '')}" style="margin-top:6px;${tpl.useProxy ? '' : 'display:none'}">
+          <div class="settings-inline-note" id="tpl-ed-proxy-note" style="margin-top:6px;${tpl.useProxy ? '' : 'display:none'}">支持 HTTP、HTTPS 和 SOCKS 代理；仅对此模板启动的 Agent 生效。</div>
+        </div>
         <div class="settings-divider" style="margin:12px 0"></div>
         <div class="settings-field">
           <label style="display:flex;align-items:center;gap:8px;font-weight:600">获取上游模型列表</label>
@@ -5309,6 +5461,13 @@
       document.body.appendChild(modalOverlay);
       const customEndpointCb = modal.querySelector('#tpl-ed-custom-endpoint');
       const endpointInput = modal.querySelector('#tpl-ed-models-endpoint');
+      const useProxyInput = modal.querySelector('#tpl-ed-use-proxy');
+      const proxyUrlInput = modal.querySelector('#tpl-ed-proxy-url');
+      const proxyNote = modal.querySelector('#tpl-ed-proxy-note');
+      useProxyInput.addEventListener('change', () => {
+        proxyUrlInput.style.display = useProxyInput.checked ? '' : 'none';
+        proxyNote.style.display = useProxyInput.checked ? '' : 'none';
+      });
       customEndpointCb.addEventListener('change', () => {
         endpointInput.style.display = customEndpointCb.checked ? '' : 'none';
       });
@@ -5339,7 +5498,15 @@
             fetchStatus.style.color = 'var(--text-error, #e85d5d)';
           }
         };
-        send({ type: 'fetch_models', apiBase, apiKey, modelsEndpoint: modelsEndpoint || undefined, templateName: tpl.name });
+        send({
+          type: 'fetch_models',
+          apiBase,
+          apiKey,
+          useProxy: useProxyInput.checked,
+          proxyUrl: proxyUrlInput.value.trim(),
+          modelsEndpoint: modelsEndpoint || undefined,
+          templateName: tpl.name,
+        });
       });
       const closeModal = () => {
         _onFetchModelsResult = null;
@@ -5354,8 +5521,14 @@
           tpl.name = newName;
           modelActiveTemplate = newName;
         }
+        const useProxy = useProxyInput.checked;
+        const proxyUrl = proxyUrlInput.value.trim();
+        const proxyError = validateProxyDraft(useProxy, proxyUrl);
+        if (proxyError) { alert(proxyError); return; }
         tpl.apiKey = modal.querySelector('#tpl-ed-apikey').value.trim();
         tpl.apiBase = modal.querySelector('#tpl-ed-apibase').value.trim();
+        tpl.useProxy = useProxy;
+        tpl.proxyUrl = proxyUrl;
         tpl.defaultModel = modal.querySelector('#tpl-ed-default').value.trim();
         tpl.opusModel = modal.querySelector('#tpl-ed-opus').value.trim();
         tpl.sonnetModel = modal.querySelector('#tpl-ed-sonnet').value.trim();
@@ -5549,6 +5722,7 @@
       const summaryBase = currentProfile?.apiBase ? escapeHtml(currentProfile.apiBase) : '默认';
       const summaryModel = currentProfile?.model ? escapeHtml(currentProfile.model) : '未设置';
       const summaryModelsCount = Array.isArray(currentProfile?.models) ? currentProfile.models.length : 0;
+      const summaryProxy = currentProfile?.useProxy ? escapeHtml(currentProfile.proxyUrl || '未填写') : '关闭';
 
       codexConfigArea.innerHTML = `
         <div class="settings-field">
@@ -5564,7 +5738,7 @@
           </div>
         </div>
         <div class="settings-inline-note">
-          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong> · API Base：<code>${summaryBase}</code> · 默认模型：<code>${summaryModel}</code> · /model 候选：<code>${summaryModelsCount}</code> 项
+          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong> · API Base：<code>${summaryBase}</code> · 代理：<code>${summaryProxy}</code> · 默认模型：<code>${summaryModel}</code> · /model 候选：<code>${summaryModelsCount}</code> 项
         </div>
       `;
 
@@ -5595,7 +5769,7 @@
       const current = profileName
         ? codexEditingProfiles.find((profile) => profile.name === profileName)
         : null;
-      const draft = current ? normalizeCodexProfile(current) : { name: '', apiKey: '', apiBase: '', model: '', models: [] };
+      const draft = current ? normalizeCodexProfile(current) : { name: '', apiKey: '', apiBase: '', useProxy: false, proxyUrl: '', model: '', models: [] };
       const initialModelListText = Array.isArray(draft.models) ? draft.models.join('\n') : '';
       const modalOverlay = document.createElement('div');
       modalOverlay.className = 'settings-overlay';
@@ -5619,6 +5793,13 @@
         <div class="settings-field">
           <label>API Base URL</label>
           <input type="text" id="codex-profile-apibase" placeholder="https://api.openai.com/v1" value="${escapeHtml(draft.apiBase || '')}">
+        </div>
+        <div class="settings-field">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="codex-profile-use-proxy"${draft.useProxy ? ' checked' : ''}> 使用代理
+          </label>
+          <input type="text" id="codex-profile-proxy-url" placeholder="http://127.0.0.1:7890" value="${escapeHtml(draft.proxyUrl || '')}" style="margin-top:6px;${draft.useProxy ? '' : 'display:none'}">
+          <div class="settings-inline-note" id="codex-profile-proxy-note" style="margin-top:6px;${draft.useProxy ? '' : 'display:none'}">支持 HTTP、HTTPS 和 SOCKS 代理；仅对此 Profile 启动的 Agent 生效。</div>
         </div>
         <div class="settings-divider" style="margin:12px 0"></div>
         <div class="settings-field">
@@ -5655,11 +5836,18 @@
       document.body.appendChild(modalOverlay);
       const customEndpointCb = modal.querySelector('#codex-profile-custom-endpoint');
       const endpointInput = modal.querySelector('#codex-profile-models-endpoint');
+      const useProxyInput = modal.querySelector('#codex-profile-use-proxy');
+      const proxyUrlInput = modal.querySelector('#codex-profile-proxy-url');
+      const proxyNote = modal.querySelector('#codex-profile-proxy-note');
       const fetchBtn = modal.querySelector('#codex-profile-fetch-models');
       const fetchStatus = modal.querySelector('#codex-profile-fetch-status');
       const datalist = modal.querySelector('#codex-profile-dl-models');
       const defaultModelInput = modal.querySelector('#codex-profile-model');
       const modelListTextarea = modal.querySelector('#codex-profile-model-list');
+      useProxyInput.addEventListener('change', () => {
+        proxyUrlInput.style.display = useProxyInput.checked ? '' : 'none';
+        proxyNote.style.display = useProxyInput.checked ? '' : 'none';
+      });
       customEndpointCb.addEventListener('change', () => {
         endpointInput.style.display = customEndpointCb.checked ? '' : 'none';
       });
@@ -5701,6 +5889,8 @@
           type: 'fetch_models',
           apiBase,
           apiKey,
+          useProxy: useProxyInput.checked,
+          proxyUrl: proxyUrlInput.value.trim(),
           modelsEndpoint: modelsEndpoint || undefined,
           profileName: current?.name || modal.querySelector('#codex-profile-name').value.trim(),
         });
@@ -5715,11 +5905,15 @@
         const name = modal.querySelector('#codex-profile-name').value.trim();
         const apiKey = modal.querySelector('#codex-profile-apikey').value.trim();
         const apiBase = modal.querySelector('#codex-profile-apibase').value.trim();
+        const useProxy = useProxyInput.checked;
+        const proxyUrl = proxyUrlInput.value.trim();
         const model = defaultModelInput.value.trim();
         const models = _parseCodexModelListText(modelListTextarea.value);
         if (!name) { alert('请填写 Profile 名称'); return; }
         if (!apiKey) { alert('请填写 API Key'); return; }
         if (!apiBase) { alert('请填写 API Base URL'); return; }
+        const proxyError = validateProxyDraft(useProxy, proxyUrl);
+        if (proxyError) { alert(proxyError); return; }
         if (!model) { alert('请填写模型'); return; }
         if (!models.length) { alert('请至少填写一个 /model 候选模型'); return; }
         if (!models.includes(model)) models.unshift(model);
@@ -5729,10 +5923,12 @@
           current.name = name;
           current.apiKey = apiKey;
           current.apiBase = apiBase;
+          current.useProxy = useProxy;
+          current.proxyUrl = proxyUrl;
           current.model = model;
           current.models = models;
         } else {
-          codexEditingProfiles.push({ name, apiKey, apiBase, model, models });
+          codexEditingProfiles.push({ name, apiKey, apiBase, useProxy, proxyUrl, model, models });
         }
         codexActiveProfile = name;
         closeModal();

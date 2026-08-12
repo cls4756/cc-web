@@ -4,7 +4,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
+const { ProxyAgent } = require('proxy-agent');
 const { createAgentRuntime } = require('./lib/agent-runtime');
+const { createCodexAppServer } = require('./lib/codex-appserver');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
 
 // Load .env
@@ -25,6 +27,38 @@ const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public
 const LOGS_DIR = process.env.CC_WEB_LOGS_DIR || path.join(__dirname, 'logs');
 const ATTACHMENTS_DIR = path.join(SESSIONS_DIR, '_attachments');
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+];
+
+function normalizeProxyConfig(value) {
+  return {
+    useProxy: !!value?.useProxy,
+    proxyUrl: String(value?.proxyUrl || '').trim(),
+  };
+}
+
+function validateProxyConfig(value) {
+  const proxy = normalizeProxyConfig(value);
+  if (!proxy.useProxy) return { ...proxy, error: '' };
+  if (!proxy.proxyUrl) return { ...proxy, error: '启用代理时必须填写代理地址。' };
+  try {
+    const parsed = new URL(proxy.proxyUrl);
+    if (!['http:', 'https:', 'socks:', 'socks4:', 'socks4a:', 'socks5:', 'socks5h:'].includes(parsed.protocol)) {
+      return { ...proxy, error: `不支持的代理协议：${parsed.protocol}` };
+    }
+  } catch {
+    return { ...proxy, error: '代理地址格式无效。' };
+  }
+  return { ...proxy, error: '' };
+}
+
+function createProxyAgent(proxyConfig) {
+  const proxy = validateProxyConfig(proxyConfig);
+  if (!proxy.useProxy || proxy.error) return null;
+  return new ProxyAgent({ getProxyForUrl: () => proxy.proxyUrl });
+}
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_MESSAGE_ATTACHMENTS = Math.max(1, parseInt(process.env.CC_MAX_MESSAGE_ATTACHMENTS, 10) || 20);
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
@@ -159,14 +193,19 @@ function truncateForChannel(text, provider) {
 }
 
 function getSummaryApiCredentials(summaryConfig) {
-  // Returns { apiBase, apiKey, model } or null
+  // Returns { apiBase, apiKey, model, useProxy, proxyUrl } or null
   const src = summaryConfig.apiSource || 'claude';
   if (src === 'claude') {
     const modelCfg = loadModelConfig();
     if (modelCfg.mode === 'custom' && modelCfg.activeTemplate) {
       const tpl = (modelCfg.templates || []).find(t => t.name === modelCfg.activeTemplate);
       if (tpl && tpl.apiKey && tpl.apiBase) {
-        return { apiBase: tpl.apiBase, apiKey: tpl.apiKey, model: tpl.defaultModel || tpl.opusModel || '' };
+        return {
+          apiBase: tpl.apiBase,
+          apiKey: tpl.apiKey,
+          model: tpl.defaultModel || tpl.opusModel || '',
+          ...normalizeProxyConfig(tpl),
+        };
       }
     }
     return null; // local mode — no API credentials available
@@ -177,7 +216,12 @@ function getSummaryApiCredentials(summaryConfig) {
       const profile = (codexCfg.profiles || []).find(p => p.name === codexCfg.activeProfile);
       if (profile && profile.apiKey && profile.apiBase) {
         const resolvedModel = splitCodexModelSpec(summaryConfig.model || profile.model || DEFAULT_CODEX_MODEL).base || DEFAULT_CODEX_MODEL;
-        return { apiBase: profile.apiBase, apiKey: profile.apiKey, model: resolvedModel };
+        return {
+          apiBase: profile.apiBase,
+          apiKey: profile.apiKey,
+          model: resolvedModel,
+          ...normalizeProxyConfig(profile),
+        };
       }
     }
     return null;
@@ -203,8 +247,10 @@ function callSummaryApi(creds, prompt) {
         max_tokens: 1024,
         messages: [{ role: 'user', content: prompt }],
       });
+      const proxyAgent = createProxyAgent(creds);
       const req = mod.request(url, {
         method: 'POST',
+        agent: proxyAgent || undefined,
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${creds.apiKey}`,
@@ -226,6 +272,7 @@ function callSummaryApi(creds, prompt) {
       });
       req.on('error', () => resolve({ ok: false, text: '' }));
       req.on('timeout', () => { req.destroy(); resolve({ ok: false, text: '' }); });
+      req.on('close', () => proxyAgent?.destroy());
       req.write(body);
       req.end();
     } catch {
@@ -707,7 +754,7 @@ const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
   mode: 'local',      // 'local' | 'custom'
-  templates: [],      // array of { name, apiKey, apiBase, defaultModel, opusModel, sonnetModel, haikuModel }
+  templates: [],      // array of { name, apiKey, apiBase, useProxy, proxyUrl, defaultModel, opusModel, sonnetModel, haikuModel }
   activeTemplate: '', // name of active template (for 'custom' mode)
   localSnapshot: {},  // saved snapshot of local ~/.claude/settings.json API config
 };
@@ -821,6 +868,7 @@ function loadCodexConfig() {
           name: String(profile?.name || '').trim(),
           apiKey: String(profile?.apiKey || ''),
           apiBase: String(profile?.apiBase || '').trim(),
+          ...normalizeProxyConfig(profile),
           model: String(profile?.model || '').trim(),
           models: normalizeCodexModelList(profile?.models, profile?.model),
         })).filter((profile) => profile.name) : [],
@@ -842,6 +890,7 @@ function saveCodexConfig(config) {
       name: String(profile?.name || '').trim(),
       apiKey: String(profile?.apiKey || ''),
       apiBase: String(profile?.apiBase || '').trim(),
+      ...normalizeProxyConfig(profile),
       model: String(profile?.model || '').trim(),
       models: normalizeCodexModelList(profile?.models, profile?.model),
     })).filter((profile) => profile.name) : [],
@@ -859,6 +908,7 @@ function getCodexConfigMasked() {
       name: profile.name,
       apiKey: maskSecret(profile.apiKey),
       apiBase: profile.apiBase || '',
+      ...normalizeProxyConfig(profile),
       model: profile.model || '',
       models: normalizeCodexModelList(profile.models, profile.model),
     })),
@@ -883,6 +933,7 @@ function getModelConfigMasked() {
       name: t.name,
       apiKey: maskSecret(t.apiKey),
       apiBase: t.apiBase || '',
+      ...normalizeProxyConfig(t),
       defaultModel: t.defaultModel || '',
       opusModel: t.opusModel || '',
       sonnetModel: t.sonnetModel || '',
@@ -1107,6 +1158,7 @@ function prepareCodexCustomRuntime(config, session = null) {
     homeDir,
     apiKey: activeProfile.apiKey,
     apiBase: runtimeApiBase,
+    ...normalizeProxyConfig(activeProfile),
     model: activeProfile.model || '',
     runtimeKey: `custom:${activeProfile.name}`,
     profileName: activeProfile.name,
@@ -1137,7 +1189,7 @@ function loadClaudeJsonModelMap() {
 const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_REASONING_MODEL'];
+  'ANTHROPIC_REASONING_MODEL', ...PROXY_ENV_KEYS];
 // root 用户下 Claude CLI 禁用 --dangerously-skip-permissions，YOLO 会被降级为 default。
 // 在 settings.json 里预先批准这些工具，让 default 模式也能直接编辑 / 执行命令，避免
 // 非交互子进程被权限询问卡死。
@@ -1186,6 +1238,12 @@ function applyCustomTemplateToSettings(tpl) {
   if (tpl.opusModel)    cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tpl.opusModel;
   if (tpl.sonnetModel)  cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tpl.sonnetModel;
   if (tpl.haikuModel)   cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tpl.haikuModel;
+  const proxy = normalizeProxyConfig(tpl);
+  if (proxy.useProxy && proxy.proxyUrl) {
+    cleanedEnv.HTTP_PROXY = proxy.proxyUrl;
+    cleanedEnv.HTTPS_PROXY = proxy.proxyUrl;
+    cleanedEnv.ALL_PROXY = proxy.proxyUrl;
+  }
   settings.env = cleanedEnv;
   if (IS_ROOT_OR_SUDO) mergeRootFallbackAllow(settings);
   // 原子写入：先写临时文件再 rename，避免 Claude 子进程读到写了一半的文件
@@ -1651,12 +1709,21 @@ function loadSession(id) {
 const sessionMetaCache = new Map(); // id -> { id, title, updated, hasUnread, agent }
 let sessionMetaCacheReady = false;
 
+function getSessionActivityTimestamp(session) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const timestamp = messages[index]?.timestamp;
+    if (timestamp && Number.isFinite(Date.parse(timestamp))) return timestamp;
+  }
+  return session?.updated || null;
+}
+
 function buildSessionMetaCacheEntry(session) {
   if (!session?.id) return null;
   return {
     id: session.id,
     title: session.title || 'Untitled',
-    updated: session.updated || null,
+    updated: getSessionActivityTimestamp(session),
     hasUnread: !!session.hasUnread,
     agent: getSessionAgent(session),
   };
@@ -1854,8 +1921,13 @@ function formatRuntimeError(agent, raw, context = {}) {
     if (/stream disconnected before completion|stream closed before response\.completed|response\.completed/i.test(condensed)) {
       return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流式协议没有完整发送 response.completed。请检查该 API 端点是否完整兼容 OpenAI Responses SSE，或切回确认兼容的 API 模板。';
     }
-    if (/ENOENT|not found|No such file/i.test(condensed)) {
+    // Must not match "unexpected status 404 Not Found" from the upstream API, which is a
+    // model/endpoint problem rather than a missing binary.
+    if (/ENOENT|command not found|No such file/i.test(condensed)) {
       return '找不到 Codex CLI。请检查 Codex 设置里的 CLI 路径，或确认系统 PATH 中可直接运行 `codex`。';
+    }
+    if (/unexpected status 404|is not supported by|unknown model|model_not_found/i.test(condensed)) {
+      return `Codex 上游未接受当前模型或接口地址：${condensed}（请在 Codex 设置里核对模型名与 API Base URL）`;
     }
     if (/unexpected argument|unexpected option|Usage:\s*codex/i.test(raw || '')) {
       return `Codex CLI 参数不兼容：${firstMeaningfulLine(condensed)}。建议检查当前 CLI 版本与 cc-web 的参数约定是否匹配。`;
@@ -1863,11 +1935,13 @@ function formatRuntimeError(agent, raw, context = {}) {
     if (/permission denied|EACCES|EPERM/i.test(condensed)) {
       return 'Codex CLI 启动失败：当前环境没有足够权限执行该命令或访问目标目录。';
     }
-    if (/authentication|unauthorized|forbidden|login|api key|credential/i.test(condensed)) {
-      return 'Codex 鉴权失败。请确认本机 Codex CLI 已完成登录，且当前凭据仍然有效。';
+    // Relays report plan/balance problems under a 401, so quota must be classified before
+    // auth — otherwise "add paid balance" is reported as a local CLI login failure.
+    if (/rate limit|quota|billing|credits|insufficient|balance|upgrade your plan|payment required|too many requests/i.test(condensed)) {
+      return `Codex 请求被额度或计费限制拦截：${condensed}`;
     }
-    if (/rate limit|quota|billing|credits/i.test(condensed)) {
-      return 'Codex 请求被额度或速率限制拦截。请检查账号配额、计费状态或稍后重试。';
+    if (/authentication|unauthorized|invalid api key|api key|credential|not logged in/i.test(condensed)) {
+      return `Codex 鉴权失败：${condensed}（请检查 Codex CLI 登录状态，若使用自定义 API 请核对模板中的密钥与地址）`;
     }
     if (/network|timed out|timeout|ECONNRESET|ENOTFOUND|TLS|certificate|fetch failed/i.test(condensed)) {
       return 'Codex 运行时网络请求失败。请检查当前网络、代理或证书环境后重试。';
@@ -2003,17 +2077,19 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   // Save result to session
   const session = loadSession(sessionId);
+  let completedMessageTimestamp = null;
   if (session && entry.fullText) {
+    completedMessageTimestamp = new Date().toISOString();
     const msg = {
       role: 'assistant',
       content: entry.fullText,
       toolCalls: entry.toolCalls || [],
-      timestamp: new Date().toISOString(),
+      timestamp: completedMessageTimestamp,
     };
     if (entry.fullTextTruncated) msg.truncated = true;
     if (entry.toolCallsTruncated) msg.toolCallsTruncated = true;
     session.messages.push(msg);
-    session.updated = new Date().toISOString();
+    session.updated = completedMessageTimestamp;
     if (!entry.ws) session.hasUnread = true;
     saveSession(session);
   }
@@ -2063,7 +2139,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
 
-    wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
+    wsSend(entry.ws, {
+      type: 'done',
+      sessionId,
+      timestamp: completedMessageTimestamp,
+      costUsd: entry.lastCost || null,
+    });
     sendSessionList(entry.ws);
     // Push notification when trigger='always' (user online but still wants notification)
     (() => {
@@ -2769,6 +2850,9 @@ wss.on('connection', (ws, req) => {
       case 'abort':
         handleAbort(ws);
         break;
+      case 'approval_response':
+        codexAppServer.resolveApproval(msg.sessionId, msg.approvalId, msg.decision);
+        break;
       case 'new_session':
         handleNewSession(ws, msg);
         break;
@@ -2779,7 +2863,13 @@ wss.on('connection', (ws, req) => {
         handleDeleteSession(ws, msg.sessionId);
         break;
       case 'truncate_session':
-        handleTruncateSession(ws, msg);
+        handleTruncateSession(ws, msg).catch((err) => {
+          plog('ERROR', 'session_truncate_fail', {
+            sessionId: String(msg.sessionId || '').slice(0, 8),
+            error: err.message,
+          });
+          wsSend(ws, { type: 'error', message: `清除失败：${err.message}` });
+        });
         break;
       case 'edit_message':
         handleEditMessage(ws, msg);
@@ -3035,10 +3125,16 @@ function handleSaveModelConfig(ws, newConfig) {
   for (const nt of newTemplates) {
     if (!nt.name || !nt.name.trim()) continue;
     const old = oldTemplates.find(t => t.name === nt.name);
+    const proxy = validateProxyConfig(nt);
+    if (proxy.error) {
+      return wsSend(ws, { type: 'error', message: `Claude 模板「${nt.name.trim()}」：${proxy.error}` });
+    }
     merged.templates.push({
       name: nt.name.trim(),
       apiKey: (nt.apiKey && !nt.apiKey.includes('****')) ? nt.apiKey : (old?.apiKey || ''),
       apiBase: nt.apiBase || '',
+      useProxy: proxy.useProxy,
+      proxyUrl: proxy.proxyUrl,
       defaultModel: nt.defaultModel || '',
       opusModel: nt.opusModel || '',
       sonnetModel: nt.sonnetModel || '',
@@ -3091,7 +3187,6 @@ function handleSaveModelConfig(ws, newConfig) {
         const tier = modelToTier.get(session.model);
         if (tier && MODEL_MAP[tier] !== session.model) {
           session.model = MODEL_MAP[tier];
-          session.updated = new Date().toISOString();
           saveSession(session);
         }
       } catch {}
@@ -3120,10 +3215,16 @@ function handleSaveCodexConfig(ws, newConfig) {
     const mergedModel = rawModel || String(old?.model || '').trim();
     const incomingModels = Array.isArray(profile?.models) ? profile.models : null;
     const mergedModelsSource = incomingModels && incomingModels.length > 0 ? incomingModels : old?.models;
+    const proxy = validateProxyConfig(profile);
+    if (proxy.error) {
+      return wsSend(ws, { type: 'error', message: `Codex Profile「${name}」：${proxy.error}` });
+    }
     mergedProfiles.push({
       name,
       apiKey: rawApiKey && !rawApiKey.includes('****') ? rawApiKey : (old?.apiKey || ''),
       apiBase: String(profile?.apiBase || '').trim(),
+      useProxy: proxy.useProxy,
+      proxyUrl: proxy.proxyUrl,
       model: mergedModel,
       models: normalizeCodexModelList(
         mergedModelsSource,
@@ -3154,8 +3255,8 @@ function handleSaveCodexConfig(ws, newConfig) {
         try {
           const session = loadSession(sessionId);
           if (!session || getSessionAgent(session) !== 'codex') continue;
+          if (session.model === nextDefaultModel) continue;
           session.model = nextDefaultModel;
-          session.updated = new Date().toISOString();
           saveSession(session);
         } catch {}
       }
@@ -3192,6 +3293,8 @@ function handleReadClaudeLocalConfig(ws) {
   const config = {
     apiKey: env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || '',
     apiBase: env.ANTHROPIC_BASE_URL || '',
+    useProxy: !!(env.HTTPS_PROXY || env.HTTP_PROXY || env.ALL_PROXY || env.https_proxy || env.http_proxy || env.all_proxy),
+    proxyUrl: env.HTTPS_PROXY || env.HTTP_PROXY || env.ALL_PROXY || env.https_proxy || env.http_proxy || env.all_proxy || '',
     defaultModel: env.ANTHROPIC_MODEL || '',
     opusModel: env.ANTHROPIC_DEFAULT_OPUS_MODEL || '',
     sonnetModel: env.ANTHROPIC_DEFAULT_SONNET_MODEL || '',
@@ -3300,6 +3403,11 @@ function handleFetchModels(ws, msg) {
     return wsSend(ws, { type: 'fetch_models_result', success: false, message: '无效的 URL: ' + fullUrl });
   }
 
+  const proxy = validateProxyConfig(msg);
+  if (proxy.error) {
+    return wsSend(ws, { type: 'fetch_models_result', success: false, message: proxy.error });
+  }
+
   // Resolve real apiKey (if masked, look up saved config by template name or apiBase)
   let realKey = apiKey;
   if (apiKey.includes('****')) {
@@ -3319,10 +3427,12 @@ function handleFetchModels(ws, msg) {
   }
 
   const mod = parsed.protocol === 'https:' ? require('https') : require('http');
+  const proxyAgent = createProxyAgent(proxy);
   const reqOptions = {
     method: 'GET',
     headers: { 'Authorization': `Bearer ${realKey}` },
     timeout: 15000,
+    agent: proxyAgent || undefined,
   };
 
   const req = mod.request(parsed, reqOptions, (res) => {
@@ -3349,6 +3459,7 @@ function handleFetchModels(ws, msg) {
     req.destroy();
     wsSend(ws, { type: 'fetch_models_result', success: false, message: '请求超时 (15s)' });
   });
+  req.on('close', () => proxyAgent?.destroy());
   req.end();
 }
 
@@ -3877,6 +3988,17 @@ function truncateClaudeContext(claudeSessionId, targetContent, occurrence) {
 function findCodexSourceRollout(session) {
   const threadId = session?.codexThreadId;
   if (!threadId) return null;
+  // cc-web 启动 Codex 时用 CODEX_HOME=<每会话独立目录>，resume 实际读取的是该目录下的
+  // rollout（而非全局 ~/.codex/sessions）。因此截断/编辑必须优先定位并改写这份「活」文件，
+  // 否则会找不到文件（或改了全局副本但下次 resume 读不到），表现为「点了没反应」。
+  const homeDir = session?.codexHomeDir;
+  if (homeDir) {
+    try {
+      for (const filePath of walkJsonlFiles(path.join(homeDir, 'sessions'))) {
+        if (filePath.includes(threadId)) return filePath;
+      }
+    } catch {}
+  }
   if (session.importedRolloutPath && fs.existsSync(session.importedRolloutPath)) {
     return session.importedRolloutPath;
   }
@@ -3908,8 +4030,7 @@ function codexEventUserText(entry) {
   if (!entry || entry.type !== 'event_msg') return null;
   const p = entry.payload || {};
   if (p.type !== 'user_message') return null;
-  const t = String(p.message || '').trim();
-  return t || null;
+  return String(p.message || '').trim();
 }
 
 // 回退截断 Codex：在目标用户轮次的 task_started 处切，删除该行及其之后所有内容。
@@ -3964,8 +4085,52 @@ function truncateCodexContext(session, targetContent, occurrence) {
   } catch (err) {
     return { found: false, writeError: err.message };
   }
-  invalidateCodexSessionCopy(session);
+  // 注意：此处直接改写的就是 Codex resume 实际读取的「活」rollout（每会话独立目录），
+  // 不能再调用 invalidateCodexSessionCopy，否则会把刚改好的文件删掉导致编辑丢失。
   return { found: true, cleared: false, filePath };
+}
+
+function countCodexTurnsFromMessage(session, targetContent, occurrence) {
+  const filePath = findCodexSourceRollout(session);
+  if (!filePath) return { found: false, fileMissing: true };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { found: false, fileMissing: true }; }
+  const parsed = content.split('\n').map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return null;
+    try { return JSON.parse(trimmed); } catch { return null; }
+  });
+
+  let seen = 0;
+  let targetLine = -1;
+  for (let i = 0; i < parsed.length; i++) {
+    const text = codexEventUserText(parsed[i]);
+    if (text !== targetContent) continue;
+    if (seen === occurrence) {
+      targetLine = i;
+      break;
+    }
+    seen++;
+  }
+  if (targetLine < 0) return { found: false };
+
+  let firstTurnLine = -1;
+  for (let i = targetLine; i >= 0; i--) {
+    const entry = parsed[i];
+    if (entry?.type === 'event_msg' && entry.payload?.type === 'task_started') {
+      firstTurnLine = i;
+      break;
+    }
+  }
+  if (firstTurnLine < 0) return { found: false };
+
+  let numTurns = 0;
+  for (let i = firstTurnLine; i < parsed.length; i++) {
+    const entry = parsed[i];
+    if (entry?.type === 'event_msg' && entry.payload?.type === 'task_started') numTurns++;
+  }
+  return { found: numTurns > 0, numTurns, filePath };
 }
 
 // 编辑 Claude 用户消息：把目标用户轮次的文本块替换为新内容，保留 uuid/parentUuid/附件块
@@ -4169,7 +4334,7 @@ function editCodexUserContext(session, oldContent, occurrence, newContent) {
   } catch (err) {
     return { found: false, writeError: err.message };
   }
-  invalidateCodexSessionCopy(session);
+  // 直接改写的是 resume 实际读取的「活」rollout，不能再删每会话副本（否则编辑丢失）。
   return { found: true };
 }
 
@@ -4232,7 +4397,7 @@ function editCodexAssistantContext(session, assistantIndex, newContent) {
   } catch (err) {
     return { found: false, writeError: err.message };
   }
-  invalidateCodexSessionCopy(session);
+  // 直接改写的是 resume 实际读取的「活」rollout，不能再删每会话副本（否则编辑丢失）。
   return { found: true };
 }
 
@@ -4247,11 +4412,22 @@ function deleteCodexLocalSession(session) {
       if (filePath.includes(threadId)) rolloutPaths.add(path.resolve(filePath));
     }
   } catch {}
+  // 每会话独立目录（CODEX_HOME）里的 rollout 才是 resume 实际使用的文件，一并清理。
+  const homeDir = session?.codexHomeDir ? path.resolve(session.codexHomeDir) : null;
+  if (homeDir) {
+    try {
+      for (const filePath of walkJsonlFiles(path.join(homeDir, 'sessions'))) {
+        if (filePath.includes(threadId)) rolloutPaths.add(path.resolve(filePath));
+      }
+    } catch {}
+  }
 
   let removedFiles = 0;
   for (const filePath of rolloutPaths) {
     try {
-      if (filePath.startsWith(CODEX_SESSIONS_DIR) && fs.existsSync(filePath)) {
+      const inGlobal = filePath.startsWith(CODEX_SESSIONS_DIR);
+      const inSessionHome = homeDir && filePath.startsWith(homeDir);
+      if ((inGlobal || inSessionHome) && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
         removedFiles++;
       }
@@ -4319,8 +4495,46 @@ function handleDeleteSession(ws, sessionId) {
   }
 }
 
-// 回退截断：删除目标消息及其之后的全部消息，并同步清理发送给 AI 的上下文（.jsonl）
-function handleTruncateSession(ws, msg) {
+async function rollbackCodexContext(session, numTurns) {
+  const spawnSpec = buildCodexSpawnSpec(session);
+  if (spawnSpec?.error) return { ok: false, error: spawnSpec.error };
+
+  let proc;
+  try {
+    proc = spawn(spawnSpec.command, spawnSpec.args, {
+      env: spawnSpec.env,
+      cwd: spawnSpec.cwd,
+      stdio: ['pipe', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    await codexAppServer.rollbackThread(proc, {
+      sessionId: session.id,
+      threadId: session.codexThreadId,
+      numTurns,
+    });
+    plog('INFO', 'codex_thread_rollback_complete', {
+      sessionId: session.id.slice(0, 8),
+      threadId: session.codexThreadId,
+      numTurns,
+    });
+    return { ok: true };
+  } catch (err) {
+    plog('WARN', 'codex_thread_rollback_fail', {
+      sessionId: session.id.slice(0, 8),
+      threadId: session.codexThreadId,
+      numTurns,
+      error: err.message,
+    });
+    return { ok: false, error: err.message };
+  } finally {
+    if (proc && !proc.killed) {
+      try { proc.kill('SIGTERM'); } catch {}
+    }
+  }
+}
+
+// 回退截断：删除目标消息及其之后的全部消息，并同步清理发送给 AI 的上下文
+async function handleTruncateSession(ws, msg) {
   const { sessionId, timestamp, content } = msg || {};
   if (!sessionId) return wsSend(ws, { type: 'error', message: '缺少 sessionId' });
 
@@ -4369,14 +4583,13 @@ function handleTruncateSession(ws, msg) {
         deleteCodexLocalSession(session);
         clearRuntimeSessionId(session);
       } else {
-        const result = truncateCodexContext(session, targetContent, occurrence);
-        if (!result.found) {
-          return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
+        const turnCount = countCodexTurnsFromMessage(session, targetContent, occurrence);
+        if (!turnCount.found) {
+          return wsSend(ws, { type: 'error', message: '无法在 Codex 上下文中定位该消息，已中止清除。请刷新后重试' });
         }
-        if (result.cleared) {
-          invalidateCodexSessionCopy(session);
-          deleteCodexLocalSession(session);
-          clearRuntimeSessionId(session);
+        const result = await rollbackCodexContext(session, turnCount.numTurns);
+        if (!result.ok) {
+          return wsSend(ws, { type: 'error', message: `Codex 上下文回滚失败，已中止清除：${result.error}` });
         }
       }
     }
@@ -4629,11 +4842,16 @@ function handleMessage(ws, msg, options = {}) {
   }
 
   if (!hideInHistory) {
+    const requestedTimestamp = typeof msg.timestamp === 'string' ? msg.timestamp : '';
+    const parsedTimestamp = requestedTimestamp ? Date.parse(requestedTimestamp) : NaN;
+    const messageTimestamp = Number.isFinite(parsedTimestamp)
+      ? new Date(parsedTimestamp).toISOString()
+      : new Date().toISOString();
     session.messages.push({
       role: 'user',
       content: textValue,
       attachments: savedAttachments,
-      timestamp: new Date().toISOString(),
+      timestamp: messageTimestamp,
     });
   }
   session.updated = new Date().toISOString();
@@ -4676,6 +4894,104 @@ function handleMessage(ws, msg, options = {}) {
     return wsSend(ws, { type: 'error', message: spawnSpec.error });
   }
   saveSession(session);
+
+  // === Codex app-server: persistent bidirectional process (approval guard) ===
+  // Unlike the detached exec path below, we keep stdin open to drive the JSON-RPC turn
+  // and relay approval decisions. This process does NOT survive a Node.js restart.
+  if (spawnSpec.appServer) {
+    const dir = runDir(currentSessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    const errorPath = path.join(dir, 'error.log');
+    const errorFd = fs.openSync(errorPath, 'w');
+
+    let proc;
+    try {
+      proc = spawn(spawnSpec.command, spawnSpec.args, {
+        env: spawnSpec.env,
+        cwd: spawnSpec.cwd,
+        stdio: ['pipe', 'pipe', errorFd],
+        windowsHide: true,
+      });
+    } catch (err) {
+      fs.closeSync(errorFd);
+      cleanRunDir(currentSessionId);
+      plog('ERROR', 'process_spawn_fail', {
+        sessionId: currentSessionId.slice(0, 8),
+        error: err.message,
+        command: spawnSpec.command,
+        cwd: spawnSpec.cwd,
+      });
+      return wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }) });
+    }
+    fs.closeSync(errorFd);
+
+    proc.on('error', (err) => {
+      plog('ERROR', 'process_spawn_fail', {
+        sessionId: currentSessionId.slice(0, 8),
+        error: err.message,
+        command: spawnSpec.command,
+        cwd: spawnSpec.cwd,
+      });
+      cleanRunDir(currentSessionId);
+      wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }) });
+    });
+
+    fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
+
+    plog('INFO', 'process_spawn', {
+      sessionId: currentSessionId.slice(0, 8),
+      pid: proc.pid,
+      agent: 'codex',
+      mode: spawnSpec.mode,
+      model: session.model || 'default',
+      resume: spawnSpec.resume,
+      codexHomeDir: spawnSpec.codexHomeDir || null,
+      command: spawnSpec.command,
+      cwd: spawnSpec.cwd,
+      args: spawnSpec.args.join(' '),
+      appServer: true,
+    });
+
+    proc.on('exit', (code, signal) => {
+      plog('INFO', 'process_exit_event', {
+        sessionId: currentSessionId.slice(0, 8),
+        pid: proc.pid,
+        exitCode: code,
+        signal,
+      });
+      setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
+    });
+
+    const entry = {
+      pid: proc.pid,
+      ws,
+      agent: 'codex',
+      cwd: spawnSpec.cwd,
+      fullText: '',
+      attachments: resolvedAttachments,
+      toolCalls: [],
+      lastCost: null,
+      lastUsage: null,
+      lastError: null,
+      errorSent: false,
+      codexHomeDir: spawnSpec.codexHomeDir || '',
+      codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
+      tailer: null,
+      appServer: true,
+    };
+    activeProcesses.set(currentSessionId, entry);
+    sendSessionList(ws);
+
+    codexAppServer.attach(proc, {
+      session,
+      sessionId: currentSessionId,
+      entry,
+      promptText: textValue,
+      attachments: resolvedAttachments,
+      spec: spawnSpec,
+    });
+    return;
+  }
 
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
@@ -4878,6 +5194,14 @@ const {
   saveSession,
   setRuntimeSessionId,
   getRuntimeSessionId,
+});
+
+const codexAppServer = createCodexAppServer({
+  wsSend,
+  plog,
+  loadSession,
+  saveSession,
+  setRuntimeSessionId,
 });
 
 // === Check Update ===

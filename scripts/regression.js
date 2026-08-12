@@ -6,6 +6,7 @@ const path = require('path');
 const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 const WebSocket = require('ws');
+const { createAgentRuntime } = require('../lib/agent-runtime');
 
 const REPO_DIR = path.resolve(__dirname, '..');
 const SERVER_PATH = path.join(REPO_DIR, 'server.js');
@@ -36,6 +37,69 @@ function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+function testProfileProxyEnv() {
+  let claudeConfig = {
+    mode: 'custom',
+    activeTemplate: 'Direct',
+    templates: [{ name: 'Direct', useProxy: false, proxyUrl: '' }],
+  };
+  let codexConfig = {
+    mode: 'custom',
+    activeProfile: 'Proxy',
+    profiles: [{ name: 'Proxy', useProxy: true, proxyUrl: 'socks5://127.0.0.1:7890' }],
+  };
+  const runtime = createAgentRuntime({
+    processEnv: {
+      HOME: '/tmp',
+      HTTP_PROXY: 'http://global-proxy:8080',
+      HTTPS_PROXY: 'http://global-proxy:8080',
+      NO_PROXY: 'localhost',
+    },
+    CLAUDE_PATH: 'claude',
+    CODEX_PATH: 'codex',
+    MODEL_MAP: {},
+    loadModelConfig: () => claudeConfig,
+    applyCustomTemplateToSettings: () => {},
+    loadCodexConfig: () => codexConfig,
+    prepareCodexCustomRuntime: (config) => ({
+      mode: 'custom',
+      homeDir: '/tmp/codex-proxy-test',
+      apiKey: 'test-key',
+      ...config.profiles[0],
+    }),
+    wsSend: () => {},
+    truncateObj: (value) => value,
+    sanitizeToolInput: (value) => value,
+    loadSession: () => null,
+    saveSession: () => {},
+    setRuntimeSessionId: () => {},
+    getRuntimeSessionId: () => null,
+  });
+
+  const directClaude = runtime.buildClaudeSpawnSpec({ permissionMode: 'default' });
+  assert(!directClaude.env.HTTP_PROXY && !directClaude.env.HTTPS_PROXY && !directClaude.env.ALL_PROXY, 'Claude direct template should clear inherited proxy variables');
+
+  claudeConfig = {
+    mode: 'custom',
+    activeTemplate: 'Proxy',
+    templates: [{ name: 'Proxy', useProxy: true, proxyUrl: 'http://127.0.0.1:7890' }],
+  };
+  const proxyClaude = runtime.buildClaudeSpawnSpec({ permissionMode: 'default' });
+  assert(proxyClaude.env.HTTP_PROXY === 'http://127.0.0.1:7890', 'Claude proxy template should inject HTTP_PROXY');
+  assert(!proxyClaude.env.NO_PROXY, 'Claude proxy template should clear inherited NO_PROXY');
+
+  const proxyCodex = runtime.buildCodexSpawnSpec({ permissionMode: 'default' });
+  assert(proxyCodex.env.ALL_PROXY === 'socks5://127.0.0.1:7890', 'Codex proxy profile should inject ALL_PROXY');
+
+  codexConfig = {
+    mode: 'custom',
+    activeProfile: 'Direct',
+    profiles: [{ name: 'Direct', useProxy: false, proxyUrl: '' }],
+  };
+  const directCodex = runtime.buildCodexSpawnSpec({ permissionMode: 'default' });
+  assert(!directCodex.env.HTTP_PROXY && !directCodex.env.HTTPS_PROXY && !directCodex.env.ALL_PROXY, 'Codex direct profile should clear inherited proxy variables');
 }
 
 function sql(dbPath, statement) {
@@ -294,6 +358,7 @@ function createFakeCodexHistory(homeDir) {
 }
 
 async function main() {
+  testProfileProxyEnv();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
   const sessionsDir = path.join(tempRoot, 'sessions');
@@ -316,6 +381,22 @@ async function main() {
   createFakeClaudeHistory(homeDir);
   const codexFixture = createFakeCodexHistory(homeDir);
 
+  const historicalSessionId = 'historical-session-time';
+  const historicalSessionPath = path.join(sessionsDir, `${historicalSessionId}.json`);
+  const pollutedUpdated = '2026-08-09T13:20:31.700Z';
+  const historicalLastMessageAt = '2024-02-03T04:05:06.000Z';
+  fs.writeFileSync(historicalSessionPath, JSON.stringify({
+    id: historicalSessionId,
+    title: 'Historical session time',
+    agent: 'codex',
+    model: 'gpt-old',
+    updated: pollutedUpdated,
+    messages: [
+      { role: 'user', content: 'old question', timestamp: '2024-02-03T04:00:00.000Z' },
+      { role: 'assistant', content: 'old answer', timestamp: historicalLastMessageAt },
+    ],
+  }, null, 2));
+
   const port = await getFreePort();
   const password = 'Regression!234';
 
@@ -331,7 +412,9 @@ async function main() {
   }, async () => {
     const { ws, messages, token } = await connectWs(port, password);
 
-    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    const initialSessionList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    const historicalSession = initialSessionList.sessions.find((session) => session.id === historicalSessionId);
+    assert(historicalSession?.updated === historicalLastMessageAt, 'Session list should use the last message timestamp instead of polluted metadata time');
 
     ws.send(JSON.stringify({
       type: 'save_codex_config',
@@ -342,6 +425,8 @@ async function main() {
           name: 'Regression Profile',
           apiKey: 'sk-regression',
           apiBase: 'https://example.com/v1',
+          useProxy: true,
+          proxyUrl: 'http://127.0.0.1:7890',
           model: 'gpt-5.5',
           models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex'],
         }],
@@ -353,9 +438,14 @@ async function main() {
     assert(codexConfigMsg.config.activeProfile === 'Regression Profile', 'Codex active profile save/load failed');
     assert(Array.isArray(codexConfigMsg.config.profiles) && codexConfigMsg.config.profiles[0]?.apiKey.includes('****'), 'Codex profile API key should be masked');
     assert(codexConfigMsg.config.profiles[0]?.model === 'gpt-5.5', 'Codex profile model save/load failed');
+    assert(codexConfigMsg.config.profiles[0]?.useProxy === true, 'Codex profile proxy toggle save/load failed');
+    assert(codexConfigMsg.config.profiles[0]?.proxyUrl === 'http://127.0.0.1:7890', 'Codex profile proxy URL save/load failed');
     assert(Array.isArray(codexConfigMsg.config.profiles[0]?.models) && codexConfigMsg.config.profiles[0].models.length === 3, 'Codex profile model list save/load failed');
     assert(codexConfigMsg.config.supportsSearch === false, 'Codex config should expose unsupported search capability');
     assert(codexConfigMsg.config.enableSearch === false, 'Codex config should ignore unsupported search toggle');
+    const historicalSessionAfterConfig = JSON.parse(fs.readFileSync(historicalSessionPath, 'utf8'));
+    assert(historicalSessionAfterConfig.updated === pollutedUpdated, 'Bulk Codex model sync should not change chat activity time');
+    assert(historicalSessionAfterConfig.model === 'gpt-5.5', 'Bulk Codex model sync should still update the session model');
 
     const codexInitCwd = path.join(tempRoot, 'codex-space');
     mkdirp(codexInitCwd);
@@ -384,7 +474,8 @@ async function main() {
     assert(firstMessageSession.agent === 'codex', 'First-message path created wrong agent');
     const runningSessionList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning));
     assert(runningSessionList.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning), 'Running Codex session should be marked as isRunning');
-    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+    const firstMessageDone = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+    assert(Number.isFinite(Date.parse(firstMessageDone.timestamp)), 'Done event should include the persisted assistant message timestamp');
 
     // Switching permission mode must not clear Codex thread id (otherwise resume loses context).
     const codexSessionPath = path.join(sessionsDir, `${firstMessageSession.sessionId}.json`);
@@ -392,6 +483,7 @@ async function main() {
     const storedAfterFirst = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
     const threadIdBeforeMode = storedAfterFirst.codexThreadId;
     assert(threadIdBeforeMode, 'Codex thread id should be persisted after first run');
+    assert(storedAfterFirst.messages.at(-1)?.timestamp === firstMessageDone.timestamp, 'Displayed assistant timestamp should match the persisted message timestamp');
 
     ws.send(JSON.stringify({ type: 'set_mode', sessionId: firstMessageSession.sessionId, mode: 'plan' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
@@ -402,21 +494,52 @@ async function main() {
     ws.send(JSON.stringify({ type: 'message', text: 'second codex prompt', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
 
-    const processLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
-    const spawnLine = processLog
-      .trim()
-      .split('\n')
-      .find((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)));
-    assert(spawnLine && !spawnLine.includes('--search') && spawnLine.includes('--image'), 'Codex exec should attach images and not append unsupported --search flag');
+    const codexFrames = (sessionId) => {
+      const p = path.join(configDir, 'codex-session-home', sessionId, 'frames.jsonl');
+      if (!fs.existsSync(p)) return [];
+      return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    };
+    const framesOf = (sessionId, method) => codexFrames(sessionId).filter((f) => f.method === method);
+    const firstFrame = (sessionId, method) => framesOf(sessionId, method)[0] || null;
+    const lastFrame = (sessionId, method) => framesOf(sessionId, method).pop() || null;
 
-	    const allSpawnsForSession = processLog
-	      .trim()
-	      .split('\n')
-	      .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)));
-	    const lastSpawn = allSpawnsForSession[allSpawnsForSession.length - 1] || '';
-	    assert(lastSpawn.includes('resume') && lastSpawn.includes(threadIdBeforeMode), 'Codex mode switch should keep resume thread id');
-	    assert(lastSpawn.includes('-s read-only'), 'Codex plan mode should set sandbox read-only');
-	    assert(lastSpawn.includes('-s read-only resume'), 'Codex resume in plan mode must place -s before resume subcommand');
+    const storedBeforeTruncate = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    const secondUserMessage = storedBeforeTruncate.messages.find((message) => message.role === 'user' && message.content === 'second codex prompt');
+    assert(secondUserMessage?.timestamp, 'Second Codex user message should be persisted with a timestamp');
+    ws.send(JSON.stringify({
+      type: 'truncate_session',
+      sessionId: firstMessageSession.sessionId,
+      timestamp: secondUserMessage.timestamp,
+      content: secondUserMessage.content,
+    }));
+    const truncatedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_truncated' && msg.sessionId === firstMessageSession.sessionId);
+    assert(truncatedCodex.messages.filter((message) => message.role === 'user').length === 1, 'Codex truncate should keep only earlier user turns');
+    const rollbackFrame = lastFrame(firstMessageSession.sessionId, 'thread/rollback');
+    assert(rollbackFrame, 'Codex truncate should call thread/rollback');
+    assert(rollbackFrame.params.threadId === threadIdBeforeMode, 'Codex rollback should target the active thread');
+    assert(rollbackFrame.params.numTurns === 1, 'Codex rollback should remove the target turn and everything after it');
+
+    // Codex now runs over the app-server, so the turn config travels as JSON-RPC params
+    // rather than argv. Assert on the frames the mock actually received.
+    const firstTurn = firstFrame(firstMessageSession.sessionId, 'turn/start');
+    assert(firstTurn, 'Codex turn/start should reach the app-server');
+    assert(firstTurn.params.input.some((i) => i.type === 'localImage'), 'Codex attachments should be sent as localImage input');
+
+    // yolo must run unsandboxed with approvals off, otherwise Codex prompts for every edit.
+    const yoloStart = firstFrame(firstMessageSession.sessionId, 'thread/start');
+    assert(yoloStart.params.sandbox === 'danger-full-access', 'Codex yolo mode should disable the sandbox');
+    assert(yoloStart.params.approvalPolicy === 'never', 'Codex yolo mode should not ask for approvals');
+
+    // The app-server handshake requires an `initialized` notification before thread/start.
+    const handshake = codexFrames(firstMessageSession.sessionId).map((f) => f.method).filter(Boolean);
+    assert(handshake.indexOf('initialized') > handshake.indexOf('initialize'), 'Codex client should send initialized after initialize');
+    assert(handshake.indexOf('initialized') < handshake.indexOf('thread/start'), 'Codex client should send initialized before thread/start');
+
+	    const resumeFrame = lastFrame(firstMessageSession.sessionId, 'thread/resume');
+	    assert(resumeFrame, 'Codex should resume an existing thread instead of starting a new one');
+	    assert(resumeFrame.params.threadId === threadIdBeforeMode, 'Codex mode switch should keep resume thread id');
+	    assert(resumeFrame.params.sandbox === 'read-only', 'Codex plan mode should set sandbox read-only');
+	    assert(resumeFrame.params.approvalPolicy === 'on-request', 'Codex plan mode should keep approvals on-request');
 
     ws.send(JSON.stringify({
       type: 'save_codex_config',
@@ -439,14 +562,9 @@ async function main() {
 
     ws.send(JSON.stringify({ type: 'message', text: 'third codex prompt', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
-    const processLogAfterProfileSwitch = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
-    const profileSwitchSpawn = processLogAfterProfileSwitch
-      .trim()
-      .split('\n')
-      .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(firstMessageSession.sessionId.slice(0, 8)))
-      .pop() || '';
-    assert(profileSwitchSpawn.includes('resume') && profileSwitchSpawn.includes(threadIdBeforeMode), 'Codex profile switch should keep resume context');
-    assert(profileSwitchSpawn.includes('--model gpt-5.4'), 'Codex profile switch should run with new profile model');
+    const profileSwitchResume = lastFrame(firstMessageSession.sessionId, 'thread/resume');
+    assert(profileSwitchResume.params.threadId === threadIdBeforeMode, 'Codex profile switch should keep resume context');
+    assert(profileSwitchResume.params.model === 'gpt-5.4', 'Codex profile switch should run with new profile model');
 
     const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-session-home', firstMessageSession.sessionId, 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
