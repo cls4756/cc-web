@@ -1249,6 +1249,34 @@ body.session-loading-active {
   white-space: nowrap;
   opacity: 0.75;
 }
+.msg-send-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 0 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.msg.is-sending .msg-bubble {
+  opacity: 0.78;
+}
+.msg.is-send-failed .msg-send-status {
+  color: var(--danger);
+}
+.msg-send-retry {
+  padding: 1px 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.msg-send-retry:hover {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
 
 .msg-avatar {
   width: 32px;

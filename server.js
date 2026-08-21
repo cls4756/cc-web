@@ -1705,6 +1705,20 @@ function loadSession(id) {
   }
 }
 
+function findSessionByClientMessageId(clientMessageId) {
+  if (!clientMessageId) return null;
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((file) => file.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const session = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8')));
+        if (session.messages.some((message) => message?.clientMessageId === clientMessageId)) return session;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 // session 元信息内存缓存：避免 sendSessionList 每次都同步遍历所有 session 文件
 const sessionMetaCache = new Map(); // id -> { id, title, updated, hasUnread, agent }
 let sessionMetaCacheReady = false;
@@ -4773,12 +4787,13 @@ function handleAbort(ws) {
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
   const { hideInHistory = false } = options;
+  const clientMessageId = typeof msg.clientMessageId === 'string' ? msg.clientMessageId.trim().slice(0, 128) : '';
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
+    return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。', clientMessageId });
   }
   if (!normalizedText && resolvedAttachments.length === 0) return;
 
@@ -4793,16 +4808,34 @@ function handleMessage(ws, msg, options = {}) {
     storageState: attachment.storageState,
   }));
 
-  if (sessionId && activeProcesses.has(sessionId)) {
-    return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。' });
-  }
-
   const derivedTitle = normalizedText
     ? textValue.slice(0, 60).replace(/\n/g, ' ')
     : `图片: ${savedAttachments[0]?.filename || 'image'}`;
 
   let session;
   if (sessionId) session = loadSession(sessionId);
+  if (!session && clientMessageId) session = findSessionByClientMessageId(clientMessageId);
+  if (session && clientMessageId) {
+    const existingMessage = session.messages.find((message) => message?.clientMessageId === clientMessageId);
+    if (existingMessage) {
+      wsSessionMap.set(ws, session.id);
+      wsSend(ws, { type: 'message_accepted', clientMessageId, sessionId: session.id });
+      if (activeProcesses.has(session.id)) {
+        const entry = activeProcesses.get(session.id);
+        entry.ws = ws;
+        wsSend(ws, {
+          type: 'resume_generating',
+          sessionId: session.id,
+          text: entry.fullText || '',
+          toolCalls: entry.toolCalls || [],
+        });
+      }
+      return;
+    }
+  }
+  if (session && activeProcesses.has(session.id)) {
+    return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。', clientMessageId });
+  }
   if (!session) {
     const id = crypto.randomUUID();
     const agent = normalizeAgent(msg.agent);
@@ -4826,7 +4859,7 @@ function handleMessage(ws, msg, options = {}) {
   normalizeSession(session);
 
   if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
-    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
+    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。', clientMessageId });
   }
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
@@ -4852,6 +4885,7 @@ function handleMessage(ws, msg, options = {}) {
       content: textValue,
       attachments: savedAttachments,
       timestamp: messageTimestamp,
+      ...(clientMessageId ? { clientMessageId } : {}),
     });
   }
   session.updated = new Date().toISOString();
@@ -4863,6 +4897,9 @@ function handleMessage(ws, msg, options = {}) {
     if (entry.ws === ws) entry.ws = null;
   }
   wsSessionMap.set(ws, currentSessionId);
+  if (clientMessageId) {
+    wsSend(ws, { type: 'message_accepted', clientMessageId, sessionId: currentSessionId });
+  }
 
   if (!sessionId) {
     wsSend(ws, {
@@ -4891,7 +4928,7 @@ function handleMessage(ws, msg, options = {}) {
     ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
     : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
   if (spawnSpec?.error) {
-    return wsSend(ws, { type: 'error', message: spawnSpec.error });
+    return wsSend(ws, { type: 'error', message: spawnSpec.error, clientMessageId });
   }
   saveSession(session);
 
@@ -4921,7 +4958,7 @@ function handleMessage(ws, msg, options = {}) {
         command: spawnSpec.command,
         cwd: spawnSpec.cwd,
       });
-      return wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }) });
+      return wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }), clientMessageId });
     }
     fs.closeSync(errorFd);
 
@@ -4933,7 +4970,7 @@ function handleMessage(ws, msg, options = {}) {
         cwd: spawnSpec.cwd,
       });
       cleanRunDir(currentSessionId);
-      wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }) });
+      wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }), clientMessageId });
     });
 
     fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
@@ -5066,7 +5103,7 @@ function handleMessage(ws, msg, options = {}) {
       path: spawnSpec.env?.PATH || null,
     });
     const agent = getSessionAgent(session);
-    return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
+    return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }), clientMessageId });
   }
 
   proc.on('error', (err) => {
@@ -5079,7 +5116,7 @@ function handleMessage(ws, msg, options = {}) {
     });
     cleanRunDir(currentSessionId);
     const agent = getSessionAgent(session);
-    wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
+    wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }), clientMessageId });
   });
 
   fs.closeSync(outputFd);

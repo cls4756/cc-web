@@ -124,6 +124,7 @@
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  const pendingOutboundMessages = new Map();
   // 单条消息最多附带的图片数量。后端默认同样为 20，可用环境变量 CC_MAX_MESSAGE_ATTACHMENTS 调整；
   // 后端会对超量部分做兜底截断，这里仅用于前端提示。
   const MAX_MESSAGE_ATTACHMENTS = 20;
@@ -2178,7 +2179,11 @@
     }
     currentModel = snapshot.model || '';
     if (!preserveStreaming) {
-      renderMessages(snapshot.messages || [], { immediate: !!options.immediate, preserveScroll, previousScrollTop });
+      renderMessages(mergePendingOutboundMessages(snapshot.messages || [], snapshot.sessionId), {
+        immediate: !!options.immediate,
+        preserveScroll,
+        previousScrollTop,
+      });
     }
     highlightActiveSession();
     renderSessionList();
@@ -2503,6 +2508,7 @@
     };
 
     ws.onclose = () => {
+      markPendingOutboundMessagesFailed('网络连接已断开，请重试');
       clearSessionLoading();
       scheduleReconnect();
     };
@@ -2510,7 +2516,9 @@
   }
 
   function send(data) {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+    if (!ws || ws.readyState !== 1) return false;
+    ws.send(JSON.stringify(data));
+    return true;
   }
 
   function submitLogin(password) {
@@ -2727,7 +2735,11 @@
         }
         if (pendingInitialSessionLoad) {
           pendingInitialSessionLoad = false;
-          if (initialPreferredSessionId && getSessionMeta(initialPreferredSessionId)) {
+          const hasUnassignedPendingMessage = Array.from(pendingOutboundMessages.values())
+            .some((pending) => !pending.sessionId);
+          if (hasUnassignedPendingMessage) {
+            highlightActiveSession();
+          } else if (initialPreferredSessionId && getSessionMeta(initialPreferredSessionId)) {
             scheduleInitialPreferredFallback();
           } else {
             syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
@@ -2739,6 +2751,7 @@
 
       case 'session_info':
         const snapshot = normalizeSessionSnapshot(msg);
+        reconcilePendingOutboundMessages(snapshot.messages);
         if (msg.sessionId && msg.sessionId === initialPreferredSessionId) {
           initialPreferredSessionApplied = true;
           clearInitialPreferredFallback();
@@ -2760,6 +2773,10 @@
             finishSessionSwitch(msg.sessionId);
           }
         }
+        break;
+
+      case 'message_accepted':
+        markOutboundMessageAccepted(msg.clientMessageId, msg.sessionId);
         break;
 
       case 'session_history_chunk':
@@ -2931,6 +2948,9 @@
 
       case 'error':
         pendingResend = null;
+        if (msg.clientMessageId) {
+          markOutboundMessageFailed(msg.clientMessageId, msg.message || '发送失败，请重试');
+        }
         appendError(msg.message);
         clearSessionLoading();
         if (!isGenerating && currentSessionId) {
@@ -3074,8 +3094,11 @@
 
     const streamEl = document.getElementById('streaming-msg');
     if (streamEl) {
-      // 若本轮出现过父目录，把末尾散落的 .tool-call 也一并收入同一父节点
-      if (hasGrouped) {
+      const hasToolCalls = !!streamEl.querySelector('.tool-call');
+      if (!pendingText && !hasToolCalls) {
+        streamEl.remove();
+      } else if (hasGrouped) {
+        // 若本轮出现过父目录，把末尾散落的 .tool-call 也一并收入同一父节点
         const toolsDiv = streamEl.querySelector('.msg-tools');
         if (toolsDiv) {
           const loose = Array.from(toolsDiv.children).filter(c => c.classList.contains('tool-call'));
@@ -3098,8 +3121,10 @@
           }
         }
       }
-      addMessageTimestamp(streamEl, timestamp || new Date().toISOString());
-      streamEl.removeAttribute('id');
+      if (streamEl.isConnected) {
+        addMessageTimestamp(streamEl, timestamp || new Date().toISOString());
+        streamEl.removeAttribute('id');
+      }
     }
 
     if (sessionId) currentSessionId = sessionId;
@@ -3393,9 +3418,124 @@
     time.textContent = text;
   }
 
-  function createMsgElement(role, content, attachments = [], timestamp = null) {
+  function setOutboundMessageState(messageElement, state, errorMessage = '') {
+    if (!messageElement) return;
+    messageElement.classList.toggle('is-sending', state === 'sending');
+    messageElement.classList.toggle('is-send-failed', state === 'failed');
+    const content = messageElement.querySelector(':scope > .msg-content');
+    if (!content) return;
+    let status = content.querySelector(':scope > .msg-send-status');
+    if (state === 'sent') {
+      if (status) status.remove();
+      return;
+    }
+    if (!status) {
+      status = document.createElement('div');
+      status.className = 'msg-send-status';
+      content.appendChild(status);
+    }
+    status.innerHTML = '';
+    const label = document.createElement('span');
+    label.textContent = state === 'failed' ? (errorMessage || '发送失败') : '正在发送…';
+    status.appendChild(label);
+    if (state === 'failed') {
+      const retryButton = document.createElement('button');
+      retryButton.type = 'button';
+      retryButton.className = 'msg-send-retry';
+      retryButton.textContent = '重试';
+      retryButton.addEventListener('click', () => retryOutboundMessage(messageElement.dataset.clientMessageId));
+      status.appendChild(retryButton);
+    }
+  }
+
+  function findOutboundMessageElement(clientMessageId) {
+    if (!clientMessageId) return null;
+    return Array.from(messagesDiv.querySelectorAll('.msg.user[data-client-message-id]'))
+      .find((element) => element.dataset.clientMessageId === clientMessageId) || null;
+  }
+
+  function markOutboundMessageAccepted(clientMessageId, sessionId) {
+    const pending = pendingOutboundMessages.get(clientMessageId);
+    if (!pending) return;
+    pendingOutboundMessages.delete(clientMessageId);
+    if (sessionId) {
+      pending.sessionId = sessionId;
+      currentSessionId = sessionId;
+      setLastSessionForAgent(pending.agent, sessionId);
+    }
+    setOutboundMessageState(findOutboundMessageElement(clientMessageId), 'sent');
+  }
+
+  function reconcilePendingOutboundMessages(messages) {
+    if (!Array.isArray(messages) || pendingOutboundMessages.size === 0) return;
+    const acceptedIds = new Set(messages.map((message) => message?.clientMessageId).filter(Boolean));
+    acceptedIds.forEach((clientMessageId) => markOutboundMessageAccepted(clientMessageId));
+  }
+
+  function mergePendingOutboundMessages(messages, sessionId) {
+    const merged = cloneMessages(messages);
+    const existingIds = new Set(merged.map((message) => message?.clientMessageId).filter(Boolean));
+    pendingOutboundMessages.forEach((pending, clientMessageId) => {
+      if (pending.sessionId !== sessionId || existingIds.has(clientMessageId)) return;
+      merged.push({
+        role: 'user',
+        content: pending.text,
+        attachments: pending.attachments,
+        timestamp: pending.timestamp,
+        clientMessageId,
+        deliveryState: pending.state,
+        deliveryError: pending.error,
+      });
+    });
+    return merged;
+  }
+
+  function markPendingOutboundMessagesFailed(message) {
+    pendingOutboundMessages.forEach((pending, clientMessageId) => {
+      if (pending.state !== 'sending') return;
+      markOutboundMessageFailed(clientMessageId, message);
+    });
+  }
+
+  function markOutboundMessageFailed(clientMessageId, message) {
+    const pending = pendingOutboundMessages.get(clientMessageId);
+    if (!pending) return;
+    pending.state = 'failed';
+    pending.error = message || '发送失败，请重试';
+    setOutboundMessageState(findOutboundMessageElement(clientMessageId), 'failed', pending.error);
+    if (isGenerating) finishGenerating();
+  }
+
+  function retryOutboundMessage(clientMessageId) {
+    const pending = pendingOutboundMessages.get(clientMessageId);
+    if (!pending || pending.state === 'sending' || isGenerating) return;
+    pending.sessionId = currentSessionId || pending.sessionId || null;
+    pending.state = 'sending';
+    pending.error = '';
+    setOutboundMessageState(findOutboundMessageElement(clientMessageId), 'sending');
+    if (!send({
+      type: 'message',
+      text: pending.text,
+      attachments: pending.attachments,
+      timestamp: pending.timestamp,
+      clientMessageId,
+      sessionId: pending.sessionId,
+      mode: pending.mode,
+      agent: pending.agent,
+    })) {
+      pending.state = 'failed';
+      pending.error = '网络尚未连接，请稍后重试';
+      setOutboundMessageState(findOutboundMessageElement(clientMessageId), 'failed', pending.error);
+      connect();
+      return;
+    }
+    startGenerating();
+  }
+
+  function createMsgElement(role, content, attachments = [], timestamp = null, options = {}) {
     const div = document.createElement('div');
     div.className = `msg ${role}${role === 'assistant' ? ' agent-' + currentAgent : ''}`;
+    if (options.clientMessageId) div.dataset.clientMessageId = options.clientMessageId;
 
     if (role === 'system') {
       const bubble = document.createElement('div');
@@ -3444,6 +3584,9 @@
     div.appendChild(messageContent);
     addMessageTimestamp(div, timestamp);
     addMessageCopyButton(bubble);
+    if (role === 'user' && options.deliveryState) {
+      setOutboundMessageState(div, options.deliveryState, options.deliveryError || '');
+    }
     return div;
   }
 
@@ -3536,7 +3679,11 @@
   }
 
 	  function buildMsgElement(m) {
-	    const el = createMsgElement(m.role, m.content, m.attachments || [], m.timestamp || null);
+	    const el = createMsgElement(m.role, m.content, m.attachments || [], m.timestamp || null, {
+        clientMessageId: m.clientMessageId || '',
+        deliveryState: m.deliveryState || '',
+        deliveryError: m.deliveryError || '',
+      });
 	    if (m.role === 'user' && m.timestamp) {
 	      const bubble = el.querySelector('.msg-bubble');
 	      if (bubble) {
@@ -4630,7 +4777,8 @@
   // --- Send Message ---
   function sendMessage() {
     const text = msgInput.value.trim();
-    if ((!text && pendingAttachments.length === 0) || isGenerating || isBlockingSessionLoad()) return;
+    const hasSendingMessage = Array.from(pendingOutboundMessages.values()).some((pending) => pending.state === 'sending');
+    if ((!text && pendingAttachments.length === 0) || isGenerating || hasSendingMessage || isBlockingSessionLoad()) return;
     hideCmdMenu();
     hideOptionPicker();
 
@@ -4674,10 +4822,44 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const timestamp = new Date().toISOString();
-    const message = { role: 'user', content: text, attachments, timestamp };
+    const clientMessageId = crypto.randomUUID();
+    const message = {
+      role: 'user',
+      content: text,
+      attachments,
+      timestamp,
+      clientMessageId,
+      deliveryState: 'sending',
+    };
+    pendingOutboundMessages.set(clientMessageId, {
+      text,
+      attachments,
+      timestamp,
+      sessionId: currentSessionId,
+      mode: currentMode,
+      agent: currentAgent,
+      state: 'sending',
+      error: '',
+    });
     messagesDiv.appendChild(buildMsgElement(message));
     scrollToBottom();
-    send({ type: 'message', text, attachments, timestamp, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+    if (!send({
+      type: 'message',
+      text,
+      attachments,
+      timestamp,
+      clientMessageId,
+      sessionId: currentSessionId,
+      mode: currentMode,
+      agent: currentAgent,
+    })) {
+      const pending = pendingOutboundMessages.get(clientMessageId);
+      pending.state = 'failed';
+      pending.error = '网络尚未连接，请稍后重试';
+      setOutboundMessageState(findOutboundMessageElement(clientMessageId), 'failed', pending.error);
+      connect();
+      return;
+    }
     startGenerating();
   }
 
