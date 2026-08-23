@@ -1780,6 +1780,8 @@ function buildSessionMetaCacheEntry(session) {
     updated: getSessionActivityTimestamp(session),
     hasUnread: !!session.hasUnread,
     agent: getSessionAgent(session),
+    claudeSessionId: session.claudeSessionId || null,
+    codexThreadId: session.codexThreadId || null,
   };
 }
 
@@ -5428,25 +5430,27 @@ function parseJsonlToMessages(lines) {
 const {
   parseCodexRolloutLines,
   getCodexRolloutFiles,
-  getImportedCodexThreadIds,
   parseCodexRolloutFile,
 } = createCodexRolloutStore({
   codexSessionsDir: CODEX_SESSIONS_DIR,
-  sessionsDir: SESSIONS_DIR,
-  normalizeSession,
   sanitizeToolInput,
 });
 
 function getImportedSessionIds() {
+  ensureSessionMetaCache();
   const imported = new Set();
-  try {
-    for (const f of fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))) {
-      try {
-        const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
-        if (s.claudeSessionId) imported.add(s.claudeSessionId);
-      } catch {}
-    }
-  } catch {}
+  for (const meta of sessionMetaCache.values()) {
+    if (meta.claudeSessionId) imported.add(meta.claudeSessionId);
+  }
+  return imported;
+}
+
+function getImportedCodexThreadIds() {
+  ensureSessionMetaCache();
+  const imported = new Set();
+  for (const meta of sessionMetaCache.values()) {
+    if (meta.codexThreadId) imported.add(meta.codexThreadId);
+  }
   return imported;
 }
 

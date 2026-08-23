@@ -658,6 +658,13 @@ async function main() {
     ws.send(JSON.stringify({ type: 'import_native_session', sessionId: firstClaude.sessionId, projectDir: nativeSessions.groups[0].dir }));
     const importedClaude = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'Claude import prompt');
     assert(importedClaude.messages?.[0]?.content === 'Claude import prompt', 'Claude import parsed wrong first message');
+    assert(firstClaude.alreadyImported === false, 'Claude session should not be flagged as imported before import');
+    ws.send(JSON.stringify({ type: 'list_native_sessions' }));
+    const nativeSessionsAfter = await nextMessage(messages, ws, (msg) => msg.type === 'native_sessions');
+    const reListedClaude = nativeSessionsAfter.groups
+      .flatMap((group) => group.sessions)
+      .find((item) => item.sessionId === firstClaude.sessionId);
+    assert(reListedClaude?.alreadyImported === true, 'Imported Claude session should be flagged as already imported');
 
     ws.send(JSON.stringify({ type: 'list_codex_sessions' }));
     const codexSessions = await nextMessage(messages, ws, (msg) => msg.type === 'codex_sessions');
@@ -668,6 +675,11 @@ async function main() {
     const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex import prompt');
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
+    assert(importedCodexItem.alreadyImported === false, 'Codex session should not be flagged as imported before import');
+    ws.send(JSON.stringify({ type: 'list_codex_sessions' }));
+    const codexSessionsAfter = await nextMessage(messages, ws, (msg) => msg.type === 'codex_sessions');
+    const reListedCodex = codexSessionsAfter.sessions.find((item) => item.threadId === codexFixture.threadId);
+    assert(reListedCodex?.alreadyImported === true, 'Imported Codex session should be flagged as already imported');
 
     const importedSessionId = importedCodex.sessionId;
     ws.send(JSON.stringify({ type: 'delete_session', sessionId: importedSessionId }));
