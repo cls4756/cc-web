@@ -677,6 +677,31 @@ async function main() {
     assert(!fs.existsSync(codexFixture.rolloutPath), 'Deleting Codex session did not remove rollout file');
     assert(sql(codexFixture.stateDb, `select count(*) from threads where id='${codexFixture.threadId}'`) === '0', 'Deleting Codex session did not remove thread row');
 
+    // A resent clientMessageId with no sessionId must resolve back to the
+    // original session, and must stop doing so once that session is deleted.
+    const retryClientMessageId = 'retry-probe-1';
+    ws.send(JSON.stringify({ type: 'message', text: 'dedupe probe', clientMessageId: retryClientMessageId, mode: 'yolo', agent: 'claude' }));
+    const firstAccept = await nextMessage(messages, ws, (msg) => msg.type === 'message_accepted' && msg.clientMessageId === retryClientMessageId);
+    const dedupeSessionId = firstAccept.sessionId;
+    assert(dedupeSessionId, 'First send should report the session it created');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === dedupeSessionId);
+
+    ws.send(JSON.stringify({ type: 'message', text: 'dedupe probe', clientMessageId: retryClientMessageId, mode: 'yolo', agent: 'claude' }));
+    const secondAccept = await nextMessage(messages, ws, (msg) => msg.type === 'message_accepted' && msg.clientMessageId === retryClientMessageId);
+    assert(secondAccept.sessionId === dedupeSessionId, 'Resent clientMessageId should map back to the original session');
+    const dedupeStored = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${dedupeSessionId}.json`), 'utf8'));
+    assert(
+      dedupeStored.messages.filter((message) => message?.clientMessageId === retryClientMessageId).length === 1,
+      'Resent clientMessageId should not be appended twice',
+    );
+
+    ws.send(JSON.stringify({ type: 'delete_session', sessionId: dedupeSessionId }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === dedupeSessionId));
+    ws.send(JSON.stringify({ type: 'message', text: 'dedupe probe', clientMessageId: retryClientMessageId, mode: 'yolo', agent: 'claude' }));
+    const thirdAccept = await nextMessage(messages, ws, (msg) => msg.type === 'message_accepted' && msg.clientMessageId === retryClientMessageId);
+    assert(thirdAccept.sessionId !== dedupeSessionId, 'Deleted session must not keep answering for its clientMessageIds');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === thirdAccept.sessionId);
+
     ws.close();
     console.log('Regression checks passed.');
   });

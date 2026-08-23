@@ -1719,21 +1719,49 @@ function loadSession(id) {
 
 function findSessionByClientMessageId(clientMessageId) {
   if (!clientMessageId) return null;
-  try {
-    const files = fs.readdirSync(SESSIONS_DIR).filter((file) => file.endsWith('.json'));
-    for (const file of files) {
-      try {
-        const session = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8')));
-        if (session.messages.some((message) => message?.clientMessageId === clientMessageId)) return session;
-      } catch {}
-    }
-  } catch {}
-  return null;
+  ensureSessionMetaCache();
+  const sessionId = clientMessageIndex.get(clientMessageId);
+  if (!sessionId) return null;
+  return loadSession(sessionId);
 }
 
 // session 元信息内存缓存：避免 sendSessionList 每次都同步遍历所有 session 文件
 const sessionMetaCache = new Map(); // id -> { id, title, updated, hasUnread, agent }
+const clientMessageIndex = new Map(); // clientMessageId -> sessionId
+const sessionClientMessageIds = new Map(); // sessionId -> Set<clientMessageId>
 let sessionMetaCacheReady = false;
+
+// Stale entries must not survive truncate/edit/delete: a clientMessageId that
+// still maps to a session it was removed from would append a retried message to
+// that session instead of starting a new one.
+function indexSessionClientMessageIds(session) {
+  if (!session?.id) return;
+  const previous = sessionClientMessageIds.get(session.id);
+  if (previous) {
+    for (const id of previous) {
+      if (clientMessageIndex.get(id) === session.id) clientMessageIndex.delete(id);
+    }
+  }
+  const messages = Array.isArray(session.messages) ? session.messages : [];
+  const ids = new Set();
+  for (const message of messages) {
+    const id = message?.clientMessageId;
+    if (!id) continue;
+    ids.add(id);
+    clientMessageIndex.set(id, session.id);
+  }
+  if (ids.size > 0) sessionClientMessageIds.set(session.id, ids);
+  else sessionClientMessageIds.delete(session.id);
+}
+
+function dropSessionClientMessageIds(sessionId) {
+  const ids = sessionClientMessageIds.get(sessionId);
+  if (!ids) return;
+  for (const id of ids) {
+    if (clientMessageIndex.get(id) === sessionId) clientMessageIndex.delete(id);
+  }
+  sessionClientMessageIds.delete(sessionId);
+}
 
 function getSessionActivityTimestamp(session) {
   const messages = Array.isArray(session?.messages) ? session.messages : [];
@@ -1764,6 +1792,7 @@ function ensureSessionMetaCache() {
         const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
         const entry = buildSessionMetaCacheEntry(s);
         if (entry) sessionMetaCache.set(entry.id, entry);
+        indexSessionClientMessageIds(s);
       } catch {}
     }
   } catch {}
@@ -1774,11 +1803,13 @@ function updateSessionMetaCache(session) {
   ensureSessionMetaCache();
   const entry = buildSessionMetaCacheEntry(session);
   if (entry) sessionMetaCache.set(entry.id, entry);
+  indexSessionClientMessageIds(session);
 }
 
 function removeSessionMetaCache(sessionId) {
   ensureSessionMetaCache();
   sessionMetaCache.delete(sessionId);
+  dropSessionClientMessageIds(sessionId);
 }
 
 function saveSession(session) {
