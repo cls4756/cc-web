@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
+const http = require('http');
 const { spawn, spawnSync } = require('child_process');
 const WebSocket = require('ws');
 const { createAgentRuntime } = require('../lib/agent-runtime');
@@ -167,17 +168,34 @@ function connectWs(port, password) {
 }
 
 async function uploadAttachment(port, token, { filename, mime, data }) {
-  const response = await fetch(`http://127.0.0.1:${port}/api/attachments`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': mime,
-      'X-Filename': encodeURIComponent(filename),
-    },
-    body: data,
+  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const { status, text } = await new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: '/api/attachments',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': mime,
+        'X-Filename': encodeURIComponent(filename),
+        'Content-Length': body.length,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end(body);
   });
-  const payload = await response.json();
-  assert(response.ok && payload.ok, `Attachment upload failed: ${payload.message || response.status}`);
+  let payload = {};
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`Attachment upload returned non-JSON (${status}): ${text.slice(0, 200)}`);
+  }
+  assert(status >= 200 && status < 300 && payload.ok, `Attachment upload failed: ${payload.message || status}`);
   return payload.attachment;
 }
 
