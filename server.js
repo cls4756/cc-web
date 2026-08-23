@@ -60,6 +60,7 @@ function createProxyAgent(proxyConfig) {
   return new ProxyAgent({ getProxyForUrl: () => proxy.proxyUrl });
 }
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const MAX_FS_LIST_ENTRIES = 2000;
 const MAX_MESSAGE_ATTACHMENTS = Math.max(1, parseInt(process.env.CC_MAX_MESSAGE_ATTACHMENTS, 10) || 20);
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
@@ -1583,6 +1584,17 @@ function resolveFsPath(rawPath) {
   return path.resolve(candidate);
 }
 
+// Shell output is a replay buffer for reconnecting clients, so keep the tail
+// (what a terminal view cares about) rather than growing without bound.
+const MAX_EXEC_OUTPUT_CHARS = 512 * 1024;
+const EXEC_OUTPUT_TRUNCATED_NOTICE = '[输出过长，已省略较早内容]\n';
+
+function appendCappedOutput(existing, text, limit = MAX_EXEC_OUTPUT_CHARS) {
+  const combined = String(existing || '') + String(text || '');
+  if (combined.length <= limit) return combined;
+  return EXEC_OUTPUT_TRUNCATED_NOTICE + combined.slice(combined.length - limit);
+}
+
 function runShellCommand(command, cwd, timeoutMs = 600000, options = {}) {
   return new Promise((resolve, reject) => {
     const targetCwd = resolveFsPath(cwd || '');
@@ -1606,14 +1618,14 @@ function runShellCommand(command, cwd, timeoutMs = 600000, options = {}) {
 
     child.stdout.on('data', (chunk) => {
       const text = chunk.toString();
-      stdout += text;
+      stdout = appendCappedOutput(stdout, text);
       if (typeof options.onStdout === 'function') {
         try { options.onStdout(text); } catch {}
       }
     });
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString();
-      stderr += text;
+      stderr = appendCappedOutput(stderr, text);
       if (typeof options.onStderr === 'function') {
         try { options.onStderr(text); } catch {}
       }
@@ -2424,7 +2436,15 @@ const server = http.createServer((req, res) => {
       const dirPath = resolveFsPath(url.searchParams.get('path') || '');
       const stat = fs.statSync(dirPath);
       if (!stat.isDirectory()) return jsonResponse(res, 400, { ok: false, message: '目标不是目录' });
-      const entries = fs.readdirSync(dirPath, { withFileTypes: true }).map((entry) => {
+      const dirents = fs.readdirSync(dirPath, { withFileTypes: true }).sort((a, b) => {
+        const aDir = a.isDirectory();
+        const bDir = b.isDirectory();
+        if (aDir !== bDir) return aDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      const total = dirents.length;
+      // stat() costs one syscall per entry, so only pay for the slice we return.
+      const entries = dirents.slice(0, MAX_FS_LIST_ENTRIES).map((entry) => {
         const fullPath = path.join(dirPath, entry.name);
         let size = 0;
         let mtime = null;
@@ -2440,9 +2460,6 @@ const server = http.createServer((req, res) => {
           size,
           mtime,
         };
-      }).sort((a, b) => {
-        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
-        return a.name.localeCompare(b.name);
       });
       const parentPath = path.dirname(dirPath);
       return jsonResponse(res, 200, {
@@ -2450,6 +2467,8 @@ const server = http.createServer((req, res) => {
         cwd: dirPath,
         parent: parentPath !== dirPath ? parentPath : null,
         entries,
+        total,
+        truncated: total > entries.length,
       });
     } catch (err) {
       return jsonResponse(res, 400, { ok: false, message: `读取目录失败: ${err.message}` });
@@ -2685,7 +2704,7 @@ const server = http.createServer((req, res) => {
             });
           },
           onStdout: (text) => {
-            execState.stdout += text;
+            execState.stdout = appendCappedOutput(execState.stdout, text);
             wsSendByToken(token, {
               type: 'exec_stream',
               event: 'stdout',
@@ -2694,7 +2713,7 @@ const server = http.createServer((req, res) => {
             }, true);
           },
           onStderr: (text) => {
-            execState.stderr += text;
+            execState.stderr = appendCappedOutput(execState.stderr, text);
             wsSendByToken(token, {
               type: 'exec_stream',
               event: 'stderr',

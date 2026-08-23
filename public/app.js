@@ -1795,7 +1795,11 @@
           </div>
         `;
       }).join('') || '<div class="file-browser-item"><span class="file-browser-item-meta">目录为空</span></div>';
-      status.textContent = `${result.entries.length} 项`;
+      const shownCount = result.entries.length;
+      const totalCount = Number.isFinite(result.total) ? result.total : shownCount;
+      status.textContent = totalCount > shownCount
+        ? `${totalCount} 项（仅显示前 ${shownCount} 项）`
+        : `${totalCount} 项`;
 
       list.querySelectorAll('[data-entry-path]').forEach((row) => {
         row.addEventListener('dblclick', async () => {
@@ -6532,7 +6536,11 @@
               </button>
             `),
           ].join('') || '<div class="file-browser-item"><span class="file-browser-item-meta">当前目录下没有子目录</span></div>';
-          statusEl.textContent = currentParent ? `${dirEntries.length} 个子目录 · 可进入上一级` : `${dirEntries.length} 个子目录`;
+          statusEl.textContent = [
+            `${dirEntries.length} 个子目录`,
+            result.truncated ? '目录项过多，已截断' : '',
+            currentParent ? '可进入上一级' : '',
+          ].filter(Boolean).join(' · ');
           okBtn.disabled = !currentPath;
           listEl.querySelectorAll('[data-nav-path]').forEach((btn) => {
             btn.addEventListener('click', () => loadDir(btn.dataset.navPath || ''));
