@@ -61,6 +61,8 @@ function createProxyAgent(proxyConfig) {
 }
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_FS_LIST_ENTRIES = 2000;
+const MAX_IMPORT_LIST_FILES = 200;
+const MAX_IMPORT_META_CACHE = 500;
 const MAX_MESSAGE_ATTACHMENTS = Math.max(1, parseInt(process.env.CC_MAX_MESSAGE_ATTACHMENTS, 10) || 20);
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const NOTIFY_CONFIG_PATH = path.join(CONFIG_DIR, 'notify.json');
@@ -5454,61 +5456,113 @@ function getImportedCodexThreadIds() {
   return imported;
 }
 
+// Import dialogs only need a summary per external history file, but the files
+// themselves are append-only transcripts. Key the summary on mtime+size so an
+// unchanged file is never re-read, and never parse more than one page of them.
+const importMetaCache = new Map(); // filePath -> { mtimeMs, size, meta }
+
+function readImportMeta(filePath, parseMeta) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return null;
+  }
+  const cached = importMetaCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.meta;
+  let meta;
+  try {
+    meta = parseMeta(filePath);
+  } catch {
+    return null;
+  }
+  if (!meta) return null;
+  if (importMetaCache.size >= MAX_IMPORT_META_CACHE) {
+    const oldest = importMetaCache.keys().next().value;
+    if (oldest !== undefined) importMetaCache.delete(oldest);
+  }
+  importMetaCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, meta });
+  return meta;
+}
+
+function parseNativeSessionMeta(filePath) {
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+  let title = null;
+  let cwd = null;
+  let lastTs = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (entry.timestamp) lastTs = entry.timestamp;
+    if (entry.type === 'user' && !cwd) {
+      cwd = entry.cwd || null;
+      const raw = entry.message?.content;
+      let text = '';
+      if (typeof raw === 'string') text = raw;
+      else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
+      if (text.trim()) title = text.trim().slice(0, 80).replace(/\n/g, ' ');
+    }
+  }
+  return { title, cwd, updatedAt: lastTs };
+}
+
 function handleListNativeSessions(ws) {
   const groups = [];
+  let totalFiles = 0;
   try {
     const imported = getImportedSessionIds();
     const dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR).filter(d => {
       try { return fs.statSync(path.join(CLAUDE_PROJECTS_DIR, d)).isDirectory(); } catch { return false; }
     });
+    const candidates = [];
     for (const dir of dirs) {
       const dirPath = path.join(CLAUDE_PROJECTS_DIR, dir);
-      const sessionItems = [];
       try {
-        const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.jsonl'));
-        for (const f of files) {
-          const sessionId = f.replace('.jsonl', '');
+        for (const f of fs.readdirSync(dirPath).filter(f => f.endsWith('.jsonl'))) {
           const filePath = path.join(dirPath, f);
-          try {
-            const content = fs.readFileSync(filePath, 'utf8');
-            const lines = content.split('\n');
-            // Find first user message for title
-            let title = sessionId.slice(0, 20);
-            let cwd = null;
-            let updatedAt = null;
-            let lastTs = null;
-            for (const line of lines) {
-              const t = line.trim();
-              if (!t) continue;
-              try {
-                const e = JSON.parse(t);
-                if (e.timestamp) lastTs = e.timestamp;
-                if (e.type === 'user' && !cwd) {
-                  cwd = e.cwd || null;
-                  const raw = e.message?.content;
-                  let text = '';
-                  if (typeof raw === 'string') text = raw;
-                  else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
-                  if (text.trim()) title = text.trim().slice(0, 80).replace(/\n/g, ' ');
-                }
-              } catch {}
-            }
-            updatedAt = lastTs;
-            sessionItems.push({ sessionId, title, cwd, updatedAt, alreadyImported: imported.has(sessionId) });
-          } catch {}
+          let mtimeMs = 0;
+          try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch {}
+          candidates.push({ dir, filePath, sessionId: f.replace('.jsonl', ''), mtimeMs });
         }
       } catch {}
-      if (sessionItems.length > 0) {
-        sessionItems.sort((a, b) => {
-          if (!a.updatedAt) return 1;
-          if (!b.updatedAt) return -1;
-          return new Date(b.updatedAt) - new Date(a.updatedAt);
-        });
-        groups.push({ dir, sessions: sessionItems });
-      }
+    }
+    totalFiles = candidates.length;
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const byDir = new Map();
+    for (const candidate of candidates.slice(0, MAX_IMPORT_LIST_FILES)) {
+      const meta = readImportMeta(candidate.filePath, parseNativeSessionMeta);
+      if (!meta) continue;
+      if (!byDir.has(candidate.dir)) byDir.set(candidate.dir, []);
+      byDir.get(candidate.dir).push({
+        sessionId: candidate.sessionId,
+        title: meta.title || candidate.sessionId.slice(0, 20),
+        cwd: meta.cwd,
+        updatedAt: meta.updatedAt,
+        alreadyImported: imported.has(candidate.sessionId),
+      });
+    }
+    for (const [dir, sessionItems] of byDir) {
+      sessionItems.sort((a, b) => {
+        if (!a.updatedAt) return 1;
+        if (!b.updatedAt) return -1;
+        return new Date(b.updatedAt) - new Date(a.updatedAt);
+      });
+      groups.push({ dir, sessions: sessionItems });
     }
   } catch {}
-  wsSend(ws, { type: 'native_sessions', groups });
+  wsSend(ws, {
+    type: 'native_sessions',
+    groups,
+    totalFiles,
+    truncated: totalFiles > MAX_IMPORT_LIST_FILES,
+  });
 }
 
 function handleImportNativeSession(ws, msg) {
@@ -5602,24 +5656,30 @@ function handleListCodexSessions(ws) {
   const imported = getImportedCodexThreadIds();
   const items = [];
   const seen = new Set();
-  for (const filePath of getCodexRolloutFiles()) {
-    const parsed = parseCodexRolloutFile(filePath);
-    if (!parsed?.meta?.threadId) continue;
-    if (seen.has(parsed.meta.threadId)) continue;
-    seen.add(parsed.meta.threadId);
-    const title = parsed.meta.title || parsed.meta.threadId.slice(0, 20);
+  const files = getCodexRolloutFiles();
+  const scanList = files.slice(0, MAX_IMPORT_LIST_FILES);
+  for (const filePath of scanList) {
+    const meta = readImportMeta(filePath, (p) => parseCodexRolloutFile(p)?.meta || null);
+    if (!meta?.threadId) continue;
+    if (seen.has(meta.threadId)) continue;
+    seen.add(meta.threadId);
     items.push({
-      threadId: parsed.meta.threadId,
-      title,
-      cwd: parsed.meta.cwd || null,
-      updatedAt: parsed.meta.updatedAt || null,
-      cliVersion: parsed.meta.cliVersion || '',
-      source: parsed.meta.source || '',
+      threadId: meta.threadId,
+      title: meta.title || meta.threadId.slice(0, 20),
+      cwd: meta.cwd || null,
+      updatedAt: meta.updatedAt || null,
+      cliVersion: meta.cliVersion || '',
+      source: meta.source || '',
       rolloutPath: filePath,
-      alreadyImported: imported.has(parsed.meta.threadId),
+      alreadyImported: imported.has(meta.threadId),
     });
   }
-  wsSend(ws, { type: 'codex_sessions', sessions: items });
+  wsSend(ws, {
+    type: 'codex_sessions',
+    sessions: items,
+    totalFiles: files.length,
+    truncated: files.length > scanList.length,
+  });
 }
 
 function handleImportCodexSession(ws, msg) {
@@ -5635,6 +5695,8 @@ function handleImportCodexSession(ws, msg) {
   }
   if (!parsed) {
     for (const filePath of getCodexRolloutFiles()) {
+      const meta = readImportMeta(filePath, (p) => parseCodexRolloutFile(p)?.meta || null);
+      if (meta?.threadId !== threadId) continue;
       const candidate = parseCodexRolloutFile(filePath);
       if (candidate?.meta?.threadId === threadId) {
         parsed = candidate;

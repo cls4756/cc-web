@@ -3034,11 +3034,11 @@
         break;
 
       case 'native_sessions':
-        if (typeof _onNativeSessions === 'function') _onNativeSessions(msg.groups || []);
+        if (typeof _onNativeSessions === 'function') _onNativeSessions(msg.groups || [], msg);
         break;
 
       case 'codex_sessions':
-        if (typeof _onCodexSessions === 'function') _onCodexSessions(msg.sessions || []);
+        if (typeof _onCodexSessions === 'function') _onCodexSessions(msg.sessions || [], msg);
         break;
 
       case 'cwd_suggestions':
@@ -6893,7 +6893,7 @@
     overlay.querySelector('#is-close-btn').addEventListener('click', close);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
-    _onNativeSessions = (groups) => {
+    _onNativeSessions = (groups, payload) => {
       const body = overlay.querySelector('#is-body');
       if (!body) return;
       if (!groups || groups.length === 0) {
@@ -6945,6 +6945,7 @@
         }
         body.appendChild(groupEl);
       }
+      appendImportTruncationNote(body, payload);
     };
 
     send({ type: 'list_native_sessions' });
@@ -6979,7 +6980,7 @@
     overlay.querySelector('#ics-close-btn').addEventListener('click', close);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
-    _onCodexSessions = (items) => {
+    _onCodexSessions = (items, payload) => {
       const body = overlay.querySelector('#ics-body');
       if (!body) return;
       if (!items || items.length === 0) {
@@ -7042,12 +7043,21 @@
         item.appendChild(btn);
         body.appendChild(item);
       });
+      appendImportTruncationNote(body, payload);
     };
 
     send({ type: 'list_codex_sessions' });
   }
 
   // --- Helpers ---
+  function appendImportTruncationNote(body, payload) {
+    if (!payload?.truncated) return;
+    const note = document.createElement('div');
+    note.className = 'import-group-title';
+    note.textContent = `仅显示最近的历史记录，共发现 ${payload.totalFiles} 个文件`;
+    body.appendChild(note);
+  }
+
   function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
