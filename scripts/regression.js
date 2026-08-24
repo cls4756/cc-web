@@ -689,6 +689,61 @@ async function main() {
     assert(!fs.existsSync(codexFixture.rolloutPath), 'Deleting Codex session did not remove rollout file');
     assert(sql(codexFixture.stateDb, `select count(*) from threads where id='${codexFixture.threadId}'`) === '0', 'Deleting Codex session did not remove thread row');
 
+    // A session longer than the initial window must arrive as a bounded window
+    // plus ordered older chunks, with the total reported independently of how
+    // much has been delivered so far.
+    const longSessionId = '11111111-2222-3333-4444-555555555555';
+    const longMessages = [];
+    for (let i = 0; i < 40; i++) {
+      longMessages.push({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: `history-${i}`,
+        attachments: [],
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+      });
+    }
+    fs.writeFileSync(path.join(sessionsDir, `${longSessionId}.json`), JSON.stringify({
+      id: longSessionId,
+      title: 'long history session',
+      created: '2026-01-01T00:00:00.000Z',
+      updated: '2026-01-01T00:00:40.000Z',
+      agent: 'claude',
+      claudeSessionId: null,
+      codexThreadId: null,
+      model: null,
+      permissionMode: 'yolo',
+      totalCost: 0,
+      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      messages: longMessages,
+      cwd: null,
+    }, null, 2));
+
+    ws.send(JSON.stringify({ type: 'load_session', sessionId: longSessionId }));
+    const longInfo = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.sessionId === longSessionId);
+    assert(longInfo.historyTotal === 40, `Long session should report 40 total, got ${longInfo.historyTotal}`);
+    assert(longInfo.messages.length < 40, 'Initial window must not carry the whole history');
+    assert(longInfo.messages.length === longInfo.historyBuffered, 'historyBuffered must match the delivered window');
+    assert(longInfo.historyPending === true, 'Long session must report that older history remains');
+    assert(
+      longInfo.messages[longInfo.messages.length - 1].content === 'history-39',
+      'Initial window must end at the newest message',
+    );
+
+    let reassembled = longInfo.messages.slice();
+    let chunkCount = 0;
+    for (;;) {
+      const chunk = await nextMessage(messages, ws, (msg) => msg.type === 'session_history_chunk' && msg.sessionId === longSessionId);
+      reassembled = chunk.messages.concat(reassembled);
+      chunkCount++;
+      if (!chunk.remaining) break;
+      assert(chunkCount < 20, 'History chunk stream did not terminate');
+    }
+    assert(reassembled.length === 40, `History chunks should reassemble to 40 messages, got ${reassembled.length}`);
+    assert(
+      reassembled.every((message, index) => message.content === `history-${index}`),
+      'History chunks should reassemble in original order',
+    );
+
     // A resent clientMessageId with no sessionId must resolve back to the
     // original session, and must stop doing so once that session is deleted.
     const retryClientMessageId = 'retry-probe-1';
