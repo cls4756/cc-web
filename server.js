@@ -61,6 +61,7 @@ function createProxyAgent(proxyConfig) {
 }
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_FS_LIST_ENTRIES = 2000;
+const MAX_FS_PROBE_NAMES = 20;
 const MAX_IMPORT_LIST_FILES = 200;
 const MAX_IMPORT_META_CACHE = 500;
 const MAX_MESSAGE_ATTACHMENTS = Math.max(1, parseInt(process.env.CC_MAX_MESSAGE_ATTACHMENTS, 10) || 20);
@@ -2516,6 +2517,33 @@ const server = http.createServer((req, res) => {
       });
     } catch (err) {
       return jsonResponse(res, 400, { ok: false, message: `读取目录失败: ${err.message}` });
+    }
+  }
+
+  // 聊天正文里出现的文件名（"成品文件：output.jpg"）需要判断是否真有这个文件，
+  // 才能决定要不要渲染成预览/下载链接。只按名字在指定目录下查，不接受路径分隔符，
+  // 免得变成任意目录的探测接口。
+  if (req.method === 'GET' && url.pathname === '/api/fs/probe') {
+    const token = extractBearerToken(req);
+    if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    try {
+      const baseDir = resolveFsPath(url.searchParams.get('base') || '');
+      const names = url.searchParams.getAll('name').slice(0, MAX_FS_PROBE_NAMES);
+      const files = [];
+      for (const raw of names) {
+        const name = String(raw || '').trim();
+        if (!name || name.includes('/') || name.includes('\\') || path.isAbsolute(name)) continue;
+        const fullPath = path.join(baseDir, name);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (!stat.isFile()) continue;
+          const mime = MIME_TYPES[path.extname(fullPath).toLowerCase()] || '';
+          files.push({ name, path: fullPath, size: stat.size, previewable: INLINE_SAFE_MIME_TYPES.has(mime) });
+        } catch {}
+      }
+      return jsonResponse(res, 200, { ok: true, base: baseDir, files });
+    } catch (err) {
+      return jsonResponse(res, 400, { ok: false, message: `探测文件失败: ${err.message}` });
     }
   }
 
