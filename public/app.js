@@ -2465,10 +2465,11 @@
     const wrapper = btn.closest('.code-block-wrapper');
     const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
     const code = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : wrapper.querySelector('code').textContent;
-    navigator.clipboard.writeText(code).then(() => {
+    copyTextToClipboard(code).then((ok) => {
+      if (!ok) return;
       btn.textContent = 'Copied!';
       setTimeout(() => btn.textContent = 'Copy', 1500);
-    });
+    }).catch(() => {});
   };
 
   window.ccTogglePreview = function (btn) {
@@ -4784,7 +4785,19 @@
   }
 
   // --- Send Message ---
+  // 兜底：发送链路上的同步异常会让按钮「点了毫无反应」，必须暴露出来，
+  // 并把卡在 sending 的消息标为失败，否则 hasSendingMessage 会永久拦住后续发送。
   function sendMessage() {
+    try {
+      performSendMessage();
+    } catch (err) {
+      console.error('sendMessage failed', err);
+      markPendingOutboundMessagesFailed('发送失败，请重试');
+      appendError(`发送失败：${err?.message || err}`);
+    }
+  }
+
+  function performSendMessage() {
     const text = msgInput.value.trim();
     const hasSendingMessage = Array.from(pendingOutboundMessages.values()).some((pending) => pending.state === 'sending');
     if ((!text && pendingAttachments.length === 0) || isGenerating || hasSendingMessage || isBlockingSessionLoad()) return;
@@ -4831,7 +4844,7 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const timestamp = new Date().toISOString();
-    const clientMessageId = crypto.randomUUID();
+    const clientMessageId = createClientMessageId();
     const message = {
       role: 'user',
       content: text,
@@ -7061,6 +7074,23 @@
     note.className = 'import-group-title';
     note.textContent = `仅显示最近的历史记录，共发现 ${payload.totalFiles} 个文件`;
     body.appendChild(note);
+  }
+
+  // crypto.randomUUID 仅在安全上下文可用，通过局域网 IP 明文访问时会缺失。
+  function createClientMessageId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    const bytes = new Uint8Array(16);
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
   function escapeHtml(str) {
