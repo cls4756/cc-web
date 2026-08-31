@@ -1219,6 +1219,24 @@
     URL.revokeObjectURL(url);
   }
 
+  // 与服务端 INLINE_SAFE_MIME_TYPES 对应：只有这些类型服务端才肯内联下发。
+  // svg 故意不在内：它是文本，走编辑器反而合适，内联渲染则有脚本风险。
+  const PREVIEWABLE_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp']);
+
+  function isPreviewableImagePath(targetPath) {
+    const ext = String(targetPath || '').split('/').pop().split('.').pop().toLowerCase();
+    return PREVIEWABLE_IMAGE_EXTS.has(ext);
+  }
+
+  // <img src> 带不了 Authorization 头，所以把 token 放 query，与 attachmentUrl 同理。
+  function fsFileUrl(targetPath, { inline = false } = {}) {
+    const params = new URLSearchParams();
+    params.set('path', targetPath);
+    if (authToken) params.set('token', authToken);
+    if (inline) params.set('inline', '1');
+    return `/api/fs/download?${params.toString()}`;
+  }
+
   const COMMAND_HISTORY_KEY = 'cc-web-cmd-history';
   const SIDEBAR_TOOLS_HEIGHT_KEY = 'cc-web-sidebar-tools-height';
   const MAX_COMMAND_HISTORY = 30;
@@ -1669,7 +1687,54 @@
     `;
   }
 
+  function openImagePreview(targetPath) {
+    const name = targetPath.split('/').pop() || 'image';
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-panel modal-panel-wide">
+        <div class="modal-header">
+          <span class="modal-title">${escapeHtml(name)}</span>
+          <button class="modal-close-btn" type="button">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="import-item-meta">${escapeHtml(targetPath)}</div>
+          <div id="image-preview-frame" style="display:flex;align-items:center;justify-content:center;min-height:200px;max-height:60vh;overflow:auto;border:1px solid var(--border-color);border-radius:10px;background:var(--bg-secondary);padding:10px;">
+            <img id="image-preview-img" alt="${escapeHtml(name)}" style="max-width:100%;max-height:56vh;object-fit:contain;display:block;">
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px;">
+            <span class="import-item-meta" id="image-preview-meta">加载中…</span>
+            <button class="btn-test" id="image-preview-download" type="button">下载</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector('.modal-close-btn').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('#image-preview-download').addEventListener('click', () => {
+      downloadFileWithAuth(targetPath).catch((err) => alert(err.message || '下载失败'));
+    });
+    const img = overlay.querySelector('#image-preview-img');
+    const meta = overlay.querySelector('#image-preview-meta');
+    img.addEventListener('load', () => {
+      meta.textContent = `${img.naturalWidth} × ${img.naturalHeight}`;
+    });
+    img.addEventListener('error', () => {
+      img.remove();
+      meta.textContent = '无法预览该图片，可尝试下载后查看。';
+    });
+    // src 用 JS 赋值而不是拼进模板，避免 token 进入 HTML 属性
+    img.src = fsFileUrl(targetPath, { inline: true });
+  }
+
   async function openFileEditor(targetPath) {
+    // 图片不进文本编辑器：utf8 往返会毁掉文件，服务端现在也会直接拒绝读取
+    if (isPreviewableImagePath(targetPath)) {
+      openImagePreview(targetPath);
+      return;
+    }
     const file = await apiFetch(`/api/fs/read?path=${encodeURIComponent(targetPath)}`);
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
@@ -1820,7 +1885,7 @@
           const entryName = row.dataset.entryName || '';
           const entryType = row.dataset.entryType;
           const menu = openFileBrowserContextMenu(e.clientX, e.clientY, [
-            { key: 'open', label: entryType === 'dir' ? '进入目录' : '查看/编辑' },
+            { key: 'open', label: entryType === 'dir' ? '进入目录' : (isPreviewableImagePath(entryPath) ? '预览' : '查看/编辑') },
             ...(entryType === 'file' ? [{ key: 'download', label: '下载' }] : []),
             { key: 'rename', label: '重命名' },
             { key: 'delete', label: '删除' },
