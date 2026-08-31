@@ -1237,6 +1237,184 @@
     return `/api/fs/download?${params.toString()}`;
   }
 
+  // 助手常只在正文里写「成品文件：output-composite.jpg」，浏览器拿不到这个文件，
+  // 用户既看不到图也没法下载。这里把正文提到的文件名探测一遍，确实存在的才补上入口。
+  // 分隔符集合刻意排除了中英文标点，好让「文件：a.png」「(a.png)」都能切出干净的文件名。
+  const FILE_MENTION_RE = /[^\s"'`<>|*?:;,=!()[\]{}，。、：；！？（）【】《》]+\.(?:png|jpe?g|webp|gif|bmp)\b/gi;
+  const MAX_FILE_MENTIONS_PER_MESSAGE = 8;
+  const MAX_FILE_PROBE_BATCH = 20; // 与服务端 MAX_FS_PROBE_NAMES 一致
+  const MAX_FILE_PROBE_CACHE = 500;
+  const fileProbeCache = new Map();
+  let fileProbeQueue = [];
+  let fileProbeTimer = null;
+
+  function rememberFileProbe(key, entry) {
+    if (fileProbeCache.size >= MAX_FILE_PROBE_CACHE) {
+      fileProbeCache.delete(fileProbeCache.keys().next().value);
+    }
+    fileProbeCache.set(key, entry);
+  }
+
+  // 逐个文件发一次请求会在渲染历史时打出一串请求，所以攒一小会儿合并成批。
+  function queueFileProbe(base, name) {
+    const key = `${base}\n${name}`;
+    if (fileProbeCache.has(key)) return Promise.resolve(fileProbeCache.get(key));
+    return new Promise((resolve) => {
+      fileProbeQueue.push({ base, name, key, resolve });
+      if (!fileProbeTimer) fileProbeTimer = setTimeout(flushFileProbes, 30);
+    });
+  }
+
+  async function flushFileProbes() {
+    fileProbeTimer = null;
+    const queued = fileProbeQueue;
+    fileProbeQueue = [];
+    const byBase = new Map();
+    for (const item of queued) {
+      if (!byBase.has(item.base)) byBase.set(item.base, new Map());
+      const names = byBase.get(item.base);
+      if (!names.has(item.name)) names.set(item.name, []);
+      names.get(item.name).push(item);
+    }
+    for (const [base, names] of byBase) {
+      const unique = Array.from(names.keys());
+      for (let i = 0; i < unique.length; i += MAX_FILE_PROBE_BATCH) {
+        const chunk = unique.slice(i, i + MAX_FILE_PROBE_BATCH);
+        const found = new Map();
+        try {
+          const params = new URLSearchParams();
+          if (base) params.set('base', base);
+          for (const name of chunk) params.append('name', name);
+          const data = await apiFetch(`/api/fs/probe?${params.toString()}`);
+          for (const file of data.files || []) found.set(file.name, file);
+        } catch {
+          // 探测失败就当文件不存在：这只是锦上添花的入口，不该弹错打断阅读
+        }
+        for (const name of chunk) {
+          const entry = found.get(name) || null;
+          for (const item of names.get(name)) {
+            rememberFileProbe(item.key, entry);
+            item.resolve(entry);
+          }
+        }
+      }
+    }
+  }
+
+  function splitFileMention(token) {
+    const slash = token.lastIndexOf('/');
+    if (slash < 0) return { base: currentCwd || '', name: token };
+    const name = token.slice(slash + 1);
+    if (!name) return null;
+    const dir = token.slice(0, slash) || '/';
+    // 相对目录要按会话 cwd 解释；服务端的 resolveFsPath 只认 process.cwd()，会解错。
+    if (dir.startsWith('/')) return { base: dir, name };
+    return { base: currentCwd ? `${currentCwd}/${dir}` : dir, name };
+  }
+
+  function collectFileMentions(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        // pre 里多是命令输出，一段目录列表能刷出满屏缩略图；a 与附件区本来就有入口了；
+        // 工具调用是折叠的实现细节，不该抢正文的名额
+        const skip = node.parentElement
+          && node.parentElement.closest('pre, a, .tool-call, .tool-group, .msg-attachments, .msg-generated-files');
+        return skip ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const seen = new Set();
+    const mentions = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const matches = node.nodeValue.match(FILE_MENTION_RE);
+      if (!matches) continue;
+      for (const token of matches) {
+        const parsed = splitFileMention(token);
+        if (!parsed) continue;
+        const key = `${parsed.base}\n${parsed.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        mentions.push(parsed);
+        if (mentions.length >= MAX_FILE_MENTIONS_PER_MESSAGE) return mentions;
+      }
+    }
+    return mentions;
+  }
+
+  function buildGeneratedFilesBlock(files) {
+    const block = document.createElement('div');
+    block.className = 'msg-generated-files';
+    const title = document.createElement('div');
+    title.className = 'msg-generated-files-title';
+    title.textContent = '正文提到的文件';
+    const list = document.createElement('div');
+    list.className = 'msg-attachments compact';
+    for (const file of files) {
+      const item = document.createElement('figure');
+      item.className = 'msg-attachment-item';
+      if (file.previewable) {
+        const thumb = document.createElement('a');
+        thumb.className = 'msg-attachment-thumb';
+        thumb.href = '#';
+        thumb.title = `${file.name}（点击预览）`;
+        const img = document.createElement('img');
+        // src 用 JS 赋值而不是拼进模板，避免 token 进入 HTML 属性
+        img.src = fsFileUrl(file.path, { inline: true });
+        img.alt = file.name;
+        img.loading = 'lazy';
+        thumb.appendChild(img);
+        thumb.addEventListener('click', (e) => {
+          e.preventDefault();
+          openImagePreview(file.path);
+        });
+        item.appendChild(thumb);
+      }
+      const download = document.createElement('a');
+      download.className = 'msg-attachment-download';
+      download.href = fsFileUrl(file.path);
+      download.setAttribute('download', file.name);
+      download.title = `下载 ${file.name}`;
+      download.textContent = `⬇ ${file.name} · ${formatFileSize(file.size)}`;
+      item.appendChild(download);
+      list.appendChild(item);
+    }
+    block.appendChild(title);
+    block.appendChild(list);
+    return block;
+  }
+
+  async function attachFileReferences(msgEl) {
+    if (!msgEl || msgEl.dataset.fileRefsDone === '1') return;
+    msgEl.dataset.fileRefsDone = '1';
+    const bubble = msgEl.querySelector('.msg-bubble');
+    const textDiv = bubble && (bubble.querySelector('.msg-text') || bubble);
+    if (!textDiv) return;
+    const mentions = collectFileMentions(textDiv);
+    if (mentions.length === 0) return;
+    const entries = await Promise.all(mentions.map((m) => queueFileProbe(m.base, m.name)));
+    const files = entries.filter(Boolean);
+    // 探测是异步的，期间可能已经切走会话或重渲染
+    if (files.length === 0 || !msgEl.isConnected) return;
+    if (bubble.querySelector(':scope > .msg-generated-files')) return;
+    bubble.appendChild(buildGeneratedFilesBlock(files));
+  }
+
+  // 不可见的历史消息不该预先探测，滚到眼前再做。
+  const fileRefsObserver = typeof IntersectionObserver === 'function'
+    ? new IntersectionObserver((records) => {
+        for (const record of records) {
+          if (!record.isIntersecting) continue;
+          fileRefsObserver.unobserve(record.target);
+          attachFileReferences(record.target);
+        }
+      }, { rootMargin: '200px' })
+    : null;
+
+  function watchFileReferences(msgEl) {
+    if (!msgEl) return;
+    if (fileRefsObserver) fileRefsObserver.observe(msgEl);
+    else attachFileReferences(msgEl);
+  }
+
   const COMMAND_HISTORY_KEY = 'cc-web-cmd-history';
   const SIDEBAR_TOOLS_HEIGHT_KEY = 'cc-web-sidebar-tools-height';
   const MAX_COMMAND_HISTORY = 30;
@@ -3195,6 +3373,7 @@
       if (streamEl.isConnected) {
         addMessageTimestamp(streamEl, timestamp || new Date().toISOString());
         streamEl.removeAttribute('id');
+        attachFileReferences(streamEl);
       }
     }
 
@@ -3234,7 +3413,7 @@
 
   function getMessageCopyText(bubble) {
     const clone = bubble.cloneNode(true);
-    clone.querySelectorAll('.msg-actions, .msg-edit-box, .msg-copy-btn, .code-block-header, .code-preview-pane, .typing-indicator').forEach((node) => node.remove());
+    clone.querySelectorAll('.msg-actions, .msg-edit-box, .msg-copy-btn, .code-block-header, .code-preview-pane, .typing-indicator, .msg-generated-files').forEach((node) => node.remove());
     return clone.innerText.replace(/\n{3,}/g, '\n\n').trim();
   }
 
@@ -3809,6 +3988,7 @@
       const bubble = el.querySelector('.msg-bubble');
       if (bubble) addMessageEditButton(bubble, m);
     }
+    if (m.role === 'assistant') watchFileReferences(el);
     return el;
   }
 
@@ -3817,6 +3997,8 @@
     const epoch = renderEpoch;
     const preserveScroll = options.preserveScroll === true;
     const previousScrollTop = Number.isFinite(options.previousScrollTop) ? options.previousScrollTop : messagesDiv.scrollTop;
+    // observer 会强引用被观察节点，整屏重渲染前必须解绑，否则切会话会持续堆积旧节点
+    if (fileRefsObserver) fileRefsObserver.disconnect();
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
       messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);

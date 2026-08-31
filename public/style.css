@@ -1535,6 +1535,19 @@ body.session-loading-active {
   font-weight: 600;
   line-height: 1.35;
 }
+.msg-generated-files {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-color);
+}
+.msg-generated-files-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.msg-generated-files .msg-attachments {
+  margin-top: 6px;
+}
 .msg-attachment-item {
   display: flex;
   flex-direction: column;
