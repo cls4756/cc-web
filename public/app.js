@@ -107,9 +107,11 @@
   let isGenerating = false;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
+  let preserveSessionViewOnReconnect = false;
   let pendingLoginPassword = '';
   let pendingText = '';
   let renderTimer = null;
+  let followLatestOutput = true;
   let activeToolCalls = new Map();
   let toolGroupCount = 0;   // 当前 .msg-tools 直接子节点数（含已有父目录）
   let hasGrouped = false;  // 本次输出是否已触发过折叠
@@ -2147,6 +2149,7 @@
     updateCwdBadge();
     refreshFileBrowser().catch(() => {});
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
+    followLatestOutput = true;
     setStatsDisplay(null);
     renderPendingAttachments();
     highlightActiveSession();
@@ -2268,7 +2271,7 @@
   function finishSessionSwitch(sessionId) {
     if (isBlockingSessionLoad(sessionId)) {
       if (activeSessionLoad?.preserveScroll) updateScrollbar();
-      else scrollToBottom();
+      else scrollToBottom({ force: true });
       requestAnimationFrame(() => clearSessionLoading(sessionId));
       return;
     }
@@ -2493,6 +2496,7 @@
 
     ws.onopen = () => {
       reconnectAttempts = 0;
+      preserveSessionViewOnReconnect = !!currentSessionId;
       // 带上上次查看的 session，让服务器在 auth 通过后顺手返回 session_info，
       // 移动端可省去一次 load_session 的 RTT。
       const preferSessionId = getLastSessionForAgent(currentAgent) || '';
@@ -2767,8 +2771,10 @@
           immediate: isBlockingSessionLoad(msg.sessionId) || activeSessionLoad?.sessionId === msg.sessionId,
           suppressUnreadToast: false,
           preserveStreaming: msg.sessionId === currentSessionId && msg.isRunning,
-          preserveScroll: activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.preserveScroll,
+          preserveScroll: (activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.preserveScroll) ||
+            (preserveSessionViewOnReconnect && msg.sessionId === currentSessionId),
         });
+        if (msg.sessionId === currentSessionId) preserveSessionViewOnReconnect = false;
         if (!msg.historyPending) {
           if (activeSessionLoad?.sessionId === msg.sessionId) {
             finalizeLoadedSession(msg.sessionId);
@@ -3021,12 +3027,7 @@
         // A background task completed (browser was disconnected or viewing another session)
         showToast(`「${msg.title}」任务完成`, msg.sessionId);
         showBrowserNotification(msg.title);
-        if (msg.sessionId === currentSessionId) {
-          // Reload current session to show completed response
-          openSession(msg.sessionId, { forceSync: true, blocking: false, preserveScroll: true });
-        } else {
-          send({ type: 'list_sessions' });
-        }
+        send({ type: 'list_sessions' });
         break;
 
       case 'password_changed':
@@ -3053,7 +3054,7 @@
 
   // --- Generating State ---
   function startGenerating() {
-    const shouldFollowOutput = isNearBottom();
+    const shouldFollowOutput = followLatestOutput;
     isGenerating = true;
     setCurrentSessionRunningState(true);
     pendingText = '';
@@ -3150,7 +3151,7 @@
   function flushRender() {
     const streamEl = document.getElementById('streaming-msg');
     if (!streamEl) return;
-    const shouldFollowOutput = isNearBottom();
+    const shouldFollowOutput = followLatestOutput;
     const bubble = streamEl.querySelector('.msg-bubble');
     if (!bubble) return;
     let textDiv = bubble.querySelector('.msg-text');
@@ -3763,7 +3764,7 @@
         messagesDiv.scrollTop = previousScrollTop;
         updateScrollbar();
       } else {
-        scrollToBottom();
+        scrollToBottom({ force: true });
       }
       return;
     }
@@ -3789,7 +3790,7 @@
       messagesDiv.scrollTop = previousScrollTop;
       updateScrollbar();
     } else {
-      scrollToBottom();
+      scrollToBottom({ force: true });
     }
 
     // Render remaining batches asynchronously, prepending each
@@ -4159,7 +4160,7 @@
   }
 
   function appendToolCall(toolUseId, name, input, done, kind = null, meta = null) {
-    const shouldFollowOutput = isNearBottom();
+    const shouldFollowOutput = followLatestOutput;
     const streamEl = document.getElementById('streaming-msg');
     if (!streamEl) return;
     const bubble = streamEl.querySelector('.msg-bubble');
@@ -4263,7 +4264,7 @@
   }
 
   function appendSystemMessage(message) {
-    const shouldFollowOutput = isNearBottom();
+    const shouldFollowOutput = followLatestOutput;
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     messagesDiv.appendChild(createMsgElement('system', message));
@@ -4271,7 +4272,7 @@
   }
 
   function appendError(message) {
-    const shouldFollowOutput = isNearBottom();
+    const shouldFollowOutput = followLatestOutput;
     const div = document.createElement('div');
     div.className = 'msg system';
     div.innerHTML = `<div class="msg-bubble" style="border-color:var(--danger);color:var(--danger)">⚠ ${escapeHtml(message)}</div>`;
@@ -4283,9 +4284,12 @@
     return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight <= threshold;
   }
 
-  function scrollToBottom() {
+  function scrollToBottom(options = {}) {
+    const force = options.force === true;
     requestAnimationFrame(() => {
+      if (!force && !followLatestOutput) return;
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      followLatestOutput = true;
       updateScrollbar();
     });
   }
@@ -4310,6 +4314,7 @@
   }
 
   messagesDiv.addEventListener('scroll', () => {
+    followLatestOutput = isNearBottom();
     updateScrollbar();
     // 移动端：滚动时短暂显示滑块，停止后淡出
     scrollbarEl.classList.add('scrolling');
@@ -4846,7 +4851,7 @@
       error: '',
     });
     messagesDiv.appendChild(buildMsgElement(message));
-    scrollToBottom();
+    scrollToBottom({ force: true });
     if (!send({
       type: 'message',
       text,
@@ -7115,12 +7120,6 @@
       connect();
     } else if (ws.readyState === 1 && currentSessionId) {
       syncRunningCommandFromServer({ force: true }).catch(() => {});
-      // Preserve active streaming UI when returning to foreground.
-      if (isGenerating || currentSessionRunning) {
-        send({ type: 'load_session', sessionId: currentSessionId });
-      } else {
-        beginSessionSwitch(currentSessionId, { blocking: false, force: true, preserveScroll: true });
-      }
     } else if (ws.readyState === 1) {
       syncRunningCommandFromServer({ force: true }).catch(() => {});
     }
