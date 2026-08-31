@@ -1336,9 +1336,18 @@ const MIME_TYPES = {
   '.js': 'text/javascript; charset=utf-8',
   '.json': 'application/json',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+
+// 只有这些类型允许 inline 呈现。SVG 不在其中：它能携带脚本，
+// 内联打开等于在应用自身的 origin 上执行任意代码。
+const INLINE_SAFE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp']);
 
 // === Utility Functions ===
 
@@ -2518,7 +2527,13 @@ const server = http.createServer((req, res) => {
       const stat = fs.statSync(filePath);
       if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
       if (stat.size > 1024 * 1024) return jsonResponse(res, 413, { ok: false, message: '文件超过 1MB，暂不支持在线编辑' });
-      const content = fs.readFileSync(filePath, 'utf8');
+      const buffer = fs.readFileSync(filePath);
+      // utf8 解码二进制会产生替换字符，一旦编辑器再按 utf8 存回就把原文件毁了，
+      // 所以宁可拒绝打开。NUL 字节是判定二进制最省事且够可靠的信号。
+      if (buffer.includes(0)) {
+        return jsonResponse(res, 415, { ok: false, message: '这是二进制文件，无法在线编辑（编辑保存会损坏文件），请改用下载。' });
+      }
+      const content = buffer.toString('utf8');
       return jsonResponse(res, 200, { ok: true, path: filePath, content, size: stat.size });
     } catch (err) {
       return jsonResponse(res, 400, { ok: false, message: `读取文件失败: ${err.message}` });
@@ -2544,16 +2559,24 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/fs/download') {
-    const token = extractBearerToken(req);
+    // 图片预览要经由 <img src>，那里带不了 Authorization 头，所以同时接受 query token
+    // （与 /api/attachments 的取法一致）。
+    const token = extractBearerToken(req) || String(url.searchParams.get('token') || '');
     if (!isTokenValid(token)) return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
     try {
       const filePath = resolveFsPath(url.searchParams.get('path') || '');
       const stat = fs.statSync(filePath);
       if (!stat.isFile()) return jsonResponse(res, 400, { ok: false, message: '目标不是文件' });
       const filename = path.basename(filePath);
+      const mime = MIME_TYPES[path.extname(filePath).toLowerCase()] || '';
+      // inline 会让内容在本应用的 origin 下被渲染，所以只对确定不含脚本的位图开放；
+      // 其余一切（含 SVG、HTML）仍按附件下发。
+      const inline = url.searchParams.get('inline') === '1' && INLINE_SAFE_MIME_TYPES.has(mime);
       res.writeHead(200, {
-        'Content-Type': 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+        'Content-Type': inline ? mime : 'application/octet-stream',
+        'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'Content-Length': stat.size,
+        'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'no-cache',
       });
       fs.createReadStream(filePath).pipe(res);
