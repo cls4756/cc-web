@@ -4630,6 +4630,10 @@ async function rollbackCodexContext(session, numTurns) {
       sessionId: session.id,
       threadId: session.codexThreadId,
       numTurns,
+      cwd: spawnSpec.cwd,
+      mode: spawnSpec.mode,
+      model: spawnSpec.model,
+      reasoningEffort: spawnSpec.reasoningEffort,
     });
     plog('INFO', 'codex_thread_rollback_complete', {
       sessionId: session.id.slice(0, 8),

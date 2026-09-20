@@ -30,6 +30,10 @@ function respond(id, result) {
   send({ jsonrpc: '2.0', id, result });
 }
 
+function respondError(id, message, code = -32000) {
+  send({ jsonrpc: '2.0', id, error: { code, message } });
+}
+
 function notify(method, params) {
   send({ jsonrpc: '2.0', method, params });
 }
@@ -182,7 +186,10 @@ function handleFrame(frame) {
       return;
 
     case 'thread/rollback':
-      state.threadId = params.threadId || state.threadId;
+      if (!state.threadId || state.threadId !== params.threadId) {
+        respondError(id, `thread not found: ${params.threadId || ''}`);
+        return;
+      }
       respond(id, { thread: { ...threadSnapshot(), turns: [] } });
       return;
 

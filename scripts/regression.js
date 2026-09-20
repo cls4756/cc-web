@@ -536,6 +536,19 @@ async function main() {
     assert(rollbackFrame, 'Codex truncate should call thread/rollback');
     assert(rollbackFrame.params.threadId === threadIdBeforeMode, 'Codex rollback should target the active thread');
     assert(rollbackFrame.params.numTurns === 1, 'Codex rollback should remove the target turn and everything after it');
+    const rollbackFrames = codexFrames(firstMessageSession.sessionId);
+    let rollbackIndex = -1;
+    for (let i = rollbackFrames.length - 1; i >= 0; i--) {
+      const frame = rollbackFrames[i];
+      if (frame.method !== 'thread/rollback') continue;
+      if (frame.params?.threadId !== threadIdBeforeMode || frame.params?.numTurns !== 1) continue;
+      rollbackIndex = i;
+      break;
+    }
+    assert(rollbackIndex >= 0, 'Codex rollback frame should remain present in the frame log');
+    const rollbackResumeFrame = rollbackFrames.slice(0, rollbackIndex).reverse().find((frame) => frame.method === 'thread/resume');
+    assert(rollbackResumeFrame, 'Codex rollback should resume the thread in the temporary app-server first');
+    assert(rollbackResumeFrame.params.threadId === threadIdBeforeMode, 'Codex rollback resume should target the active thread');
 
     // Codex now runs over the app-server, so the turn config travels as JSON-RPC params
     // rather than argv. Assert on the frames the mock actually received.

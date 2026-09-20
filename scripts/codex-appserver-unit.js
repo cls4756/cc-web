@@ -215,5 +215,45 @@ function feed2(p, obj) { p.stdout.emit('data', Buffer.from(JSON.stringify(obj) +
   assert.strictEqual(lastReq().result.action, 'decline', 'elicitation -> decline');
 }
 
-console.log('ALL ASSERTIONS PASSED ✓');
-process.exit(0);
+(async () => {
+  const rollbackProc = makeFakeProc();
+  const rollbackPromise = app.rollbackThread(rollbackProc, {
+    sessionId: 'rollback-session',
+    threadId: 'thread-rollback',
+    numTurns: 2,
+    cwd,
+    mode: 'plan',
+    model: 'gpt-test',
+    reasoningEffort: 'high',
+  });
+
+  const initialize = JSON.parse(rollbackProc.stdin.written[0]);
+  assert.strictEqual(initialize.method, 'initialize', 'rollback initializes the temporary app-server');
+  feed2(rollbackProc, { id: initialize.id, result: { userAgent: 'x' } });
+
+  const rollbackHandshake = rollbackProc.stdin.written.map((value) => JSON.parse(value));
+  const initialized = rollbackHandshake.find((frame) => frame.method === 'initialized');
+  const resume = rollbackHandshake.find((frame) => frame.method === 'thread/resume');
+  assert(initialized, 'rollback sends initialized notification');
+  assert(resume, 'rollback resumes the thread before rolling it back');
+  assert.strictEqual(resume.params.threadId, 'thread-rollback');
+  assert.strictEqual(resume.params.cwd, cwd);
+  assert.strictEqual(resume.params.sandbox, 'read-only');
+  assert.strictEqual(resume.params.approvalPolicy, 'on-request');
+  assert.strictEqual(resume.params.model, 'gpt-test');
+  assert.deepStrictEqual(resume.params.config, { model_reasoning_effort: 'high' });
+
+  feed2(rollbackProc, { id: resume.id, result: { thread: { id: 'thread-rollback' } } });
+  const rollback = JSON.parse(rollbackProc.stdin.written[rollbackProc.stdin.written.length - 1]);
+  assert.strictEqual(rollback.method, 'thread/rollback', 'rollback starts only after thread/resume succeeds');
+  assert.deepStrictEqual(rollback.params, { threadId: 'thread-rollback', numTurns: 2 });
+
+  feed2(rollbackProc, { id: rollback.id, result: { thread: { id: 'thread-rollback' } } });
+  await rollbackPromise;
+
+  console.log('ALL ASSERTIONS PASSED ✓');
+  process.exit(0);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
