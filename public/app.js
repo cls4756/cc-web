@@ -5747,8 +5747,17 @@
       ).join('');
 
       if (isLocal) {
-        const hasSnapshot = modelCurrentConfig?.localSnapshot && Object.keys(modelCurrentConfig.localSnapshot).length > 0
-          && (modelCurrentConfig.localSnapshot.apiKey || modelCurrentConfig.localSnapshot.apiBase);
+        const snapshot = modelCurrentConfig?.localSnapshot || {};
+        const hasSnapshot = Object.keys(snapshot).length > 0
+          && (snapshot.apiKey || snapshot.apiBase);
+        const localTierParts = [];
+        if (snapshot.opusModel) localTierParts.push(`Opus <code>${escapeHtml(snapshot.opusModel)}</code>`);
+        if (snapshot.sonnetModel) localTierParts.push(`Sonnet <code>${escapeHtml(snapshot.sonnetModel)}</code>`);
+        if (snapshot.haikuModel) localTierParts.push(`Haiku <code>${escapeHtml(snapshot.haikuModel)}</code>`);
+        const localTierLine = localTierParts.length ? `<br>模型映射：${localTierParts.join(' · ')}` : '';
+        const localSummary = hasSnapshot
+          ? `API Key：<code>${snapshot.apiKey ? '已设置' : '未设置'}</code> · API Base：<code>${snapshot.apiBase ? escapeHtml(snapshot.apiBase) : '默认'}</code> · 默认模型：<code>${snapshot.defaultModel ? escapeHtml(snapshot.defaultModel) : '未设置'}</code>${localTierLine}`
+          : '尚未读取本机配置，点击「读取当前配置」查看 <code>~/.claude/settings.json</code> 中的 API 信息。';
         claudeConfigArea.innerHTML = `
           <div class="settings-field">
             <label>激活模板</label>
@@ -5763,6 +5772,7 @@
               ${hasSnapshot ? '<button class="btn-test" id="claude-restore-btn" style="padding:4px 10px">恢复快照</button>' : ''}
             </div>
           </div>
+          <div class="settings-inline-note">${localSummary}</div>
           <div class="settings-inline-note">
             Agent 直接使用本机 <code>~/.claude/settings.json</code> 中的 API 信息，不会覆盖或修改本机配置。
           </div>
@@ -5791,7 +5801,18 @@
 
       // Custom template selected
       const tpl = modelEditingTemplates.find(t => t.name === modelActiveTemplate);
-      const summary = tpl ? `API Key: <code>${tpl.apiKey ? '已设置' : '未设置'}</code> · Base: <code>${escapeHtml(tpl.apiBase || '默认')}</code> · 代理：<code>${tpl.useProxy ? escapeHtml(tpl.proxyUrl || '未填写') : '关闭'}</code>` : '';
+      let summary = '';
+      if (tpl) {
+        const summaryBase = tpl.apiBase ? escapeHtml(tpl.apiBase) : '默认';
+        const summaryProxy = tpl.useProxy ? escapeHtml(tpl.proxyUrl || '未填写') : '关闭';
+        const summaryDefault = tpl.defaultModel ? escapeHtml(tpl.defaultModel) : '未设置';
+        const tierParts = [];
+        if (tpl.opusModel) tierParts.push(`Opus <code>${escapeHtml(tpl.opusModel)}</code>`);
+        if (tpl.sonnetModel) tierParts.push(`Sonnet <code>${escapeHtml(tpl.sonnetModel)}</code>`);
+        if (tpl.haikuModel) tierParts.push(`Haiku <code>${escapeHtml(tpl.haikuModel)}</code>`);
+        const tierLine = tierParts.length ? `<br>模型映射：${tierParts.join(' · ')}` : '';
+        summary = `当前模板：<strong>${escapeHtml(tpl.name)}</strong> · API Key：<code>${tpl.apiKey ? '已设置' : '未设置'}</code> · API Base：<code>${summaryBase}</code> · 代理：<code>${summaryProxy}</code> · 默认模型：<code>${summaryDefault}</code>${tierLine}`;
+      }
       claudeConfigArea.innerHTML = `
         <div class="settings-field">
           <label>激活模板</label>
