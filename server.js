@@ -4253,7 +4253,7 @@ function countCodexTurnsFromMessage(session, targetContent, occurrence) {
 }
 
 // 编辑 Claude 用户消息：把目标用户轮次的文本块替换为新内容，保留 uuid/parentUuid/附件块
-function editClaudeUserContext(claudeSessionId, oldContent, occurrence, newContent) {
+function editClaudeUserContext(claudeSessionId, oldContent, occurrence, newContent, addedAttachments, removedAttachmentIds) {
   const filePath = findClaudeSessionFile(claudeSessionId);
   if (!filePath) return { found: false, fileMissing: true };
 
@@ -4281,24 +4281,60 @@ function editClaudeUserContext(claudeSessionId, oldContent, occurrence, newConte
   let entry;
   try { entry = JSON.parse(lines[targetIdx].trim()); } catch { return { found: false }; }
   const raw = entry.message?.content;
+
+  // 构建要写入的 content 数组
+  let contentArray;
   if (typeof raw === 'string') {
-    entry.message.content = newContent;
+    contentArray = [{ type: 'text', text: newContent }];
   } else if (Array.isArray(raw)) {
-    let replaced = false;
-    const next = [];
+    contentArray = [];
+    let textReplaced = false;
     for (const b of raw) {
       if (b && b.type === 'text') {
-        if (!replaced) { next.push({ ...b, text: newContent }); replaced = true; }
-        // 丢弃多余 text 块，合并为一块
+        if (!textReplaced) { contentArray.push({ ...b, text: newContent }); textReplaced = true; }
       } else {
-        next.push(b);
+        // 过滤掉被移除的 image block（通过 source.data 匹配 base64 内容）
+        if (b && b.type === 'image' && removedAttachmentIds && removedAttachmentIds.length > 0) {
+          const src = b && b.source;
+          if (src && src.type === 'base64' && src.data) {
+            const shouldRemove = removedAttachmentIds.some((attId) => {
+              const meta = loadAttachmentMeta(attId);
+              if (!meta || !meta.path) return false;
+              try {
+                const fileData = fs.readFileSync(meta.path).toString('base64');
+                return fileData === src.data;
+              } catch { return false; }
+            });
+            if (shouldRemove) continue;
+          }
+        }
+        contentArray.push(b);
       }
     }
-    if (!replaced) next.unshift({ type: 'text', text: newContent });
-    entry.message.content = next;
+    if (!textReplaced) contentArray.unshift({ type: 'text', text: newContent });
+
+    // 添加新附件的 image block
+    if (addedAttachments && addedAttachments.length > 0) {
+      for (const att of addedAttachments) {
+        const meta = loadAttachmentMeta(sanitizeId(att.id || ''));
+        if (!meta || !meta.path) continue;
+        try {
+          const data = fs.readFileSync(meta.path).toString('base64');
+          contentArray.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: meta.mime || 'image/png',
+              data,
+            },
+          });
+        } catch {}
+      }
+    }
   } else {
     return { found: false };
   }
+  entry.message.content = contentArray;
   lines[targetIdx] = JSON.stringify(entry);
 
   try {
@@ -4767,6 +4803,10 @@ function handleEditMessage(ws, msg) {
   const messages = Array.isArray(session.messages) ? session.messages : [];
   const oldContent = typeof content === 'string' ? content : '';
 
+  // 附件变更（仅用户消息）
+  const addedAttachments = Array.isArray(msg?.addedAttachments) ? msg.addedAttachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
+  const removedAttachmentIds = Array.from(new Set((Array.isArray(msg?.removedAttachmentIds) ? msg.removedAttachmentIds : []).map(String).filter(Boolean)));
+
   // 按 时间戳 + 角色 定位（用户消息再要求内容一致，作为额外保险）
   let index = -1;
   for (let i = 0; i < messages.length; i++) {
@@ -4780,9 +4820,21 @@ function handleEditMessage(ws, msg) {
   if (index < 0) {
     return wsSend(ws, { type: 'error', message: '未找到对应消息，可能已变化，请刷新后重试' });
   }
-  if ((messages[index].content || '') === next) {
+  const contentUnchanged = (messages[index].content || '') === next;
+  const attachmentsChanged = addedAttachments.length > 0 || removedAttachmentIds.length > 0;
+  if (contentUnchanged && !attachmentsChanged) {
     return wsSend(ws, { type: 'message_edited', sessionId, messages });
   }
+
+  // 真正新增的附件（不在原消息中）
+  const existingAttachmentIds = new Set(
+    (Array.isArray(messages[index].attachments) ? messages[index].attachments : [])
+      .map((a) => sanitizeId(a?.id || ''))
+      .filter(Boolean)
+  );
+  const trulyAddedAttachments = addedAttachments.filter(
+    (a) => !existingAttachmentIds.has(sanitizeId(a?.id || ''))
+  );
 
   const runtimeId = getRuntimeSessionId(session);
   if (runtimeId) {
@@ -4804,7 +4856,7 @@ function handleEditMessage(ws, msg) {
       }
       result = isCodex
         ? editCodexUserContext(session, oldContent, occurrence, next)
-        : editClaudeUserContext(session.claudeSessionId, oldContent, occurrence, next);
+        : editClaudeUserContext(session.claudeSessionId, oldContent, occurrence, next, trulyAddedAttachments, removedAttachmentIds);
     }
     if (!result.found && !result.fileMissing) {
       return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
@@ -4816,10 +4868,44 @@ function handleEditMessage(ws, msg) {
     // 工具调用流程已随上下文删除，展示也同步去掉
     delete editedMsg.toolCalls;
   }
+
+  // 应用附件变更（仅用户消息）
+  if (role === 'user') {
+    let existingAtts = normalizeMessageAttachments(Array.isArray(messages[index].attachments) ? messages[index].attachments : []);
+    if (removedAttachmentIds.length > 0) {
+      existingAtts = existingAtts.filter((a) => !removedAttachmentIds.includes(a.id));
+    }
+    if (trulyAddedAttachments.length > 0) {
+      const normalizedAdded = normalizeMessageAttachments(trulyAddedAttachments).filter((a) => a.storageState === 'available');
+      for (const att of normalizedAdded) {
+        if (!existingAtts.some((a) => a.id === att.id)) {
+          existingAtts.push(att);
+        }
+      }
+    }
+    editedMsg.attachments = existingAtts;
+  }
+
   messages[index] = editedMsg;
   session.messages = messages;
   session.updated = new Date().toISOString();
   saveSession(session);
+
+  // 清理被移除的附件文件（如果不再被任何消息引用）
+  if (removedAttachmentIds.length > 0) {
+    const remainingIds = new Set();
+    for (const m of messages) {
+      if (Array.isArray(m.attachments)) {
+        for (const a of m.attachments) {
+          const id = sanitizeId(a?.id || '');
+          if (id) remainingIds.add(id);
+        }
+      }
+    }
+    for (const id of removedAttachmentIds) {
+      if (!remainingIds.has(id)) removeAttachmentById(id);
+    }
+  }
 
   plog('INFO', 'message_edited', { sessionId: sessionId.slice(0, 8), index, role });
 

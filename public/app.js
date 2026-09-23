@@ -3569,6 +3569,13 @@
       hidden.push(textNode);
     }
 
+    // 隐藏原有的附件展示，改为在编辑栏内管理
+    const oldAttachments = bubble.querySelector('.msg-attachments');
+    if (oldAttachments) {
+      oldAttachments.style.display = 'none';
+      hidden.push(oldAttachments);
+    }
+
     const box = document.createElement('div');
     box.className = 'msg-edit-box';
     const ta = document.createElement('textarea');
@@ -3590,6 +3597,103 @@
       hint.textContent = '保存将删除本轮的工具调用记录';
       row.appendChild(hint);
     }
+
+    // --- 附件管理 (仅用户消息支持) ---
+    const editAttachments = [];
+    let editRemovedAttachmentIds = [];
+    let addBtn = null;
+    let originalOnchange = null;
+
+    function renderEditAttachments() {
+      if (!isAssistant) {
+        const tray = box.querySelector('.msg-edit-attachment-tray');
+        if (!tray) return;
+        if (editAttachments.length === 0 && editRemovedAttachmentIds.length === 0) {
+          tray.hidden = true;
+          tray.innerHTML = '';
+          return;
+        }
+        tray.hidden = false;
+        const html = editAttachments.map((attachment, index) => `
+          <div class="attachment-chip" data-index="${index}">
+            <div class="attachment-chip-meta">
+              <span class="attachment-chip-name">${escapeHtml(attachment.filename || 'image')}</span>
+              <span class="attachment-chip-note">${formatFileSize(attachment.size)} · 附加到本条消息</span>
+            </div>
+            <button class="attachment-chip-remove" type="button" data-index="${index}" title="移除">✕</button>
+          </div>
+        `).join('');
+        tray.innerHTML = html;
+        tray.querySelectorAll('.attachment-chip-remove').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const index = Number(btn.dataset.index);
+            const [removed] = editAttachments.splice(index, 1);
+            editRemovedAttachmentIds.push(removed.id);
+            renderEditAttachments();
+          });
+        });
+      }
+    }
+
+    if (!isAssistant) {
+      const attachments = (Array.isArray(message.attachments) ? message.attachments : []).filter((a) => a.storageState !== 'expired');
+      editAttachments.push(...attachments.map((a) => ({ ...a })));
+
+      addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'msg-edit-add-attachment';
+      addBtn.textContent = '添加附件';
+      addBtn.title = '上传图片并附加到本条消息';
+
+      const tray = document.createElement('div');
+      tray.className = 'msg-edit-attachment-tray attachment-tray';
+      tray.hidden = true;
+      box.appendChild(tray);
+      renderEditAttachments();
+
+      // 保存原始 onchange，编辑结束后恢复
+      originalOnchange = imageUploadInput ? imageUploadInput.onchange : null;
+      addBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (editAttachments.length + editRemovedAttachmentIds.length >= MAX_MESSAGE_ATTACHMENTS) {
+          showToast(`单条消息最多附带 ${MAX_MESSAGE_ATTACHMENTS} 张图片`);
+          return;
+        }
+        if (!imageUploadInput) return;
+        imageUploadInput.onchange = async (ev) => {
+          const files = Array.from(ev.target.files || []).filter((f) => f && /^image\//.test(f.type || ''));
+          if (!files.length) { imageUploadInput.onchange = originalOnchange; return; }
+          const room = MAX_MESSAGE_ATTACHMENTS - editAttachments.length - editRemovedAttachmentIds.length;
+          const toUpload = files.slice(0, Math.max(0, room));
+          const extra = files.slice(Math.max(0, room));
+          if (extra.length > 0) showToast(`单条消息最多附带 ${MAX_MESSAGE_ATTACHMENTS} 张图片，已忽略超出部分`);
+
+          // 上传并直接放入编辑栏
+          const uploadPromises = toUpload.map(async (file) => {
+            const optimized = await compressImageFile(file);
+            return uploadImageFile(optimized);
+          });
+          const results = await Promise.allSettled(uploadPromises);
+          const errors = [];
+          for (const result of results) {
+            if (result.status === 'fulfilled') {
+              editAttachments.push(result.value);
+            } else {
+              errors.push(result.reason?.message || '图片上传失败');
+            }
+          }
+          if (errors.length > 0) appendError(errors[0]);
+          renderEditAttachments();
+          if (imageUploadInput) imageUploadInput.value = '';
+          imageUploadInput.onchange = originalOnchange;
+        };
+        imageUploadInput.click();
+      });
+    }
+
+    if (addBtn) row.appendChild(addBtn);
     row.appendChild(saveBtn);
     row.appendChild(cancelBtn);
     box.appendChild(ta);
@@ -3606,6 +3710,15 @@
     ta.setSelectionRange(ta.value.length, ta.value.length);
 
     const cleanup = () => {
+      // 回退未发送的新增上传附件
+      for (const a of editAttachments) {
+        if (!message.attachments?.some((ma) => ma.id === a.id)) {
+          deleteUploadedAttachment(a.id);
+        }
+      }
+      // 恢复被移除的附件 (仅客户端删除记录，文件不实际删除)
+      editRemovedAttachmentIds = [];
+      if (imageUploadInput) imageUploadInput.onchange = originalOnchange || null;
       box.remove();
       hidden.forEach((node) => { node.style.display = ''; });
       if (actions) actions.style.display = '';
@@ -3616,20 +3729,29 @@
       e.stopPropagation();
       const next = ta.value;
       if (!next.trim()) { showToast('内容不能为空'); return; }
-      if (next === original) { cleanup(); return; }
       if (!currentSessionId) return;
+      const isAssistant = message.role === 'assistant';
       const confirmMsg = isAssistant
         ? '将修改这条 AI 回复并同步更新上下文，本轮的工具调用记录会被删除。确定保存吗？'
         : '将修改这条消息，并同步更新发送给 AI 的上下文。确定保存吗？';
       if (!confirm(confirmMsg)) return;
-      send({
+      if (next === original && editAttachments.length === 0 && editRemovedAttachmentIds.length === 0) {
+        cleanup();
+        return;
+      }
+      const payload = {
         type: 'edit_message',
         sessionId: currentSessionId,
         role: message.role || 'user',
         timestamp: message.timestamp || null,
         content: original,
         newContent: next,
-      });
+      };
+      if (!isAssistant) {
+        payload.addedAttachments = editAttachments.map((a) => ({ ...a }));
+        payload.removedAttachmentIds = editRemovedAttachmentIds;
+      }
+      send(payload);
       cleanup();
     });
     ta.addEventListener('keydown', (e) => {

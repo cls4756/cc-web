@@ -1483,6 +1483,9 @@ body.session-loading-active {
   align-items: center;
   gap: 8px;
 }
+.msg-edit-row:has(.msg-edit-add-attachment) {
+  justify-content: space-between;
+}
 .msg-edit-hint {
   margin-right: auto;
   font-size: 12px;
@@ -1503,6 +1506,15 @@ body.session-loading-active {
   color: #fff;
 }
 .msg-edit-cancel {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+.msg-edit-add-attachment {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  font-size: 12px;
+  cursor: pointer;
   background: var(--bg-secondary);
   color: var(--text-secondary);
 }
