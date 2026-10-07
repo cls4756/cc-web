@@ -224,6 +224,14 @@ function nextMessage(messages, ws, predicate, timeoutMs = 15000) {
   });
 }
 
+// Like nextMessage, but ignores messages that were already buffered when the caller
+// started waiting. Needed for "absence" predicates (e.g. a session disappearing from the
+// list): a stale buffered list would otherwise match instantly and let the test observe
+// a half-finished server-side operation.
+function nextMessageAfter(messages, ws, minIndex, predicate, timeoutMs = 15000) {
+  return nextMessage(messages, ws, (msg) => messages.indexOf(msg) >= minIndex && predicate(msg), timeoutMs);
+}
+
 function createFakeClaudeHistory(homeDir) {
   const projectDir = path.join(homeDir, '.claude', 'projects', 'tmp-project');
   mkdirp(projectDir);
@@ -630,6 +638,24 @@ async function main() {
 	      assert(/trigger codex context limit/.test(autoCompactRetry.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
 	    }
 
+    // A misaligned Codex tool call must not poison the session: cc-web repairs the
+    // rollout and re-drives the same turn once instead of making the user resend.
+    const mismatchCwd = path.join(tempRoot, 'codex-tool-mismatch');
+    mkdirp(mismatchCwd);
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: mismatchCwd, mode: 'yolo' }));
+    const mismatchSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === mismatchCwd);
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger codex tool output mismatch', sessionId: mismatchSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const mismatchRepair = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /工具调用与结果错位/.test(msg.message || ''), 20000);
+    assert(/自动修复/.test(mismatchRepair.message || ''), 'Codex tool-output mismatch should announce auto repair');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === mismatchSession.sessionId, 20000);
+    const mismatchLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
+    assert(mismatchLog.includes('codex_tool_output_mismatch_retry'), 'Codex tool-output mismatch retry should be logged');
+    const mismatchSpawns = mismatchLog
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes('"event":"process_spawn"') && line.includes(mismatchSession.sessionId.slice(0, 8)));
+    assert(mismatchSpawns.length >= 2, 'Codex tool-output mismatch should respawn the app-server for the retry');
+
     const claudeAttachment = await uploadAttachment(port, token, {
       filename: 'claude-test.png',
       mime: 'image/png',
@@ -664,6 +690,37 @@ async function main() {
     assert(lastClaudeSpawn.includes(`--resume ${claudeSessionIdBeforeMode}`), 'Claude mode switch should keep --resume session id');
     assert(lastClaudeSpawn.includes('--permission-mode plan'), 'Claude plan mode should set --permission-mode plan');
 
+    // 重新发送（truncate_session）时，如果 Claude 的 .jsonl 上下文不存在（例如会话从未落盘、
+    // 进程被中断，或文件已被清理），截断应视为空操作并继续，而不是报「无法在上下文中定位该消息」。
+    const storedClaudeForTruncate = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    const secondClaudeUser = [...storedClaudeForTruncate.messages]
+      .reverse()
+      .find((message) => message.role === 'user' && message.content === 'second claude prompt');
+    assert(secondClaudeUser?.timestamp, 'Second Claude user message should be persisted with a timestamp');
+    ws.send(JSON.stringify({
+      type: 'truncate_session',
+      sessionId: claudeImageSession.sessionId,
+      timestamp: secondClaudeUser.timestamp,
+      content: secondClaudeUser.content,
+    }));
+    const truncatedClaude = await nextMessage(
+      messages,
+      ws,
+      (msg) => msg.type === 'error' || (msg.type === 'session_truncated' && msg.sessionId === claudeImageSession.sessionId),
+    );
+    assert(
+      truncatedClaude.type === 'session_truncated',
+      `Claude truncate with a missing context file should succeed, got: ${truncatedClaude.message || truncatedClaude.type}`,
+    );
+    assert(
+      truncatedClaude.messages.filter((message) => message.role === 'user').length === 1,
+      'Claude truncate should keep only the earlier user turn',
+    );
+    assert(
+      fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8').includes('claude_truncate_context_absent'),
+      'Claude truncate with a missing context file should record that the context truncation was skipped',
+    );
+
     ws.send(JSON.stringify({ type: 'list_native_sessions' }));
     const nativeSessions = await nextMessage(messages, ws, (msg) => msg.type === 'native_sessions');
     assert(nativeSessions.groups?.length > 0, 'Claude native session listing failed');
@@ -695,8 +752,9 @@ async function main() {
     assert(reListedCodex?.alreadyImported === true, 'Imported Codex session should be flagged as already imported');
 
     const importedSessionId = importedCodex.sessionId;
+    const codexDeleteBaseline = messages.length;
     ws.send(JSON.stringify({ type: 'delete_session', sessionId: importedSessionId }));
-    await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === importedSessionId));
+    await nextMessageAfter(messages, ws, codexDeleteBaseline, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === importedSessionId));
 
     assert(!fs.existsSync(path.join(sessionsDir, `${importedSessionId}.json`)), 'Deleting Codex session did not remove session JSON');
     assert(!fs.existsSync(codexFixture.rolloutPath), 'Deleting Codex session did not remove rollout file');
@@ -775,8 +833,9 @@ async function main() {
       'Resent clientMessageId should not be appended twice',
     );
 
+    const dedupeDeleteBaseline = messages.length;
     ws.send(JSON.stringify({ type: 'delete_session', sessionId: dedupeSessionId }));
-    await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === dedupeSessionId));
+    await nextMessageAfter(messages, ws, dedupeDeleteBaseline, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === dedupeSessionId));
     ws.send(JSON.stringify({ type: 'message', text: 'dedupe probe', clientMessageId: retryClientMessageId, mode: 'yolo', agent: 'claude' }));
     const thirdAccept = await nextMessage(messages, ws, (msg) => msg.type === 'message_accepted' && msg.clientMessageId === retryClientMessageId);
     assert(thirdAccept.sessionId !== dedupeSessionId, 'Deleted session must not keep answering for its clientMessageIds');

@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node server.js",
     "regression": "node scripts/regression.js",
-    "test:codex-appserver": "node scripts/codex-appserver-unit.js"
+    "test:codex-appserver": "node scripts/codex-appserver-unit.js",
+    "test:codex-rollout-repair": "node scripts/codex-rollout-repair-unit.js"
   },
   "dependencies": {
     "@highlightjs/cdn-assets": "^11.9.0",

@@ -1992,6 +1992,12 @@ function formatRuntimeError(agent, raw, context = {}) {
     if (/stream disconnected before completion|stream closed before response\.completed|response\.completed/i.test(condensed)) {
       return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流式协议没有完整发送 response.completed。请检查该 API 端点是否完整兼容 OpenAI Responses SSE，或切回确认兼容的 API 模板。';
     }
+    // A tool call whose output is missing/misplaced poisons the whole replayed history:
+    // every later turn fails the same way until the rollout is repaired. cc-web fixes the
+    // pairing before the next resume, so the user only needs to resend.
+    if (/no tool output found for tool call|output is missing for call id/i.test(condensed)) {
+      return `Codex 上下文中的工具调用与结果不匹配（缺少或错位），上游拒绝了本次请求：${firstMeaningfulLine(condensed)}。cc-web 会在下次发送时自动修复上下文，请直接重新发送或回复「继续」即可。`;
+    }
     // Must not match "unexpected status 404 Not Found" from the upstream API, which is a
     // model/endpoint problem rather than a missing binary.
     if (/ENOENT|command not found|No such file/i.test(condensed)) {
@@ -2087,9 +2093,20 @@ function isContextLimitError(agent, raw) {
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
 
-function handleProcessComplete(sessionId, exitCode, signal) {
+// Upstream rejects a replayed history when a tool call has no matching output (or the
+// output was displaced by another message). This is recoverable: repair the rollout and
+// re-drive the turn once.
+function isToolOutputMismatchError(raw) {
+  return /no tool output found for tool call|output is missing for call id/i.test(String(raw || ''));
+}
+
+function handleProcessComplete(sessionId, exitCode, signal, expectedPid = null) {
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
+  // A process may be replaced (e.g. the auto-retry respawns the app-server) before the
+  // delayed exit handler or the PID monitor runs. Ignore stale completions so they cannot
+  // tear down the new run.
+  if (expectedPid != null && entry.pid !== expectedPid) return;
 
   const completeTime = new Date().toISOString();
   const wsConnected = !!entry.ws;
@@ -2136,6 +2153,46 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     stderr: stderrSnippet || null,
     requestTooLarge: contextLimitExceeded,
   });
+
+  // Codex can leave a tool call and its output misaligned in the rollout (e.g. a
+  // synthetic user warning written between them). Every later resume then fails with
+  // the same upstream error, so repair the rollout and re-drive the very same turn once
+  // instead of making the user resend.
+  if (
+    isToolOutputMismatchError(rawCompletionError) &&
+    entry.agent === 'codex' &&
+    entry.appServer &&
+    !entry.autoRetryAttempted &&
+    entry.ws && entry.ws.readyState === 1 &&
+    entry.promptText &&
+    !pendingSlashCommands.has(sessionId)
+  ) {
+    entry.autoRetryAttempted = true;
+    const retrySession = loadSession(sessionId);
+    const retryAttachments = Array.isArray(entry.attachments) ? entry.attachments : [];
+    if (retrySession && getRuntimeSessionId(retrySession)) {
+      const retrySpec = buildCodexSpawnSpec(retrySession, { attachments: retryAttachments });
+      if (!retrySpec?.error && retrySpec.appServer) {
+        if (entry.tailer) { try { entry.tailer.stop(); } catch {} entry.tailer = null; }
+        repairCodexRolloutBeforeResume(retrySession);
+        plog('INFO', 'codex_tool_output_mismatch_retry', {
+          sessionId: sessionId.slice(0, 8),
+          threadId: retrySession.codexThreadId || null,
+        });
+        wsSend(entry.ws, { type: 'system_message', message: '检测到 Codex 上下文里的工具调用与结果错位，已自动修复并重试本次请求…' });
+        startCodexAppServer({
+          ws: entry.ws,
+          session: retrySession,
+          sessionId,
+          spawnSpec: retrySpec,
+          promptText: entry.promptText,
+          attachments: retryAttachments,
+          entry,
+        });
+        return;
+      }
+    }
+  }
 
   // Final read
   if (entry.tailer) {
@@ -2279,7 +2336,7 @@ setInterval(() => {
         pid: entry.pid,
         wsConnected: !!entry.ws,
       });
-      handleProcessComplete(sessionId, null, 'unknown (detected by monitor)');
+      handleProcessComplete(sessionId, null, 'unknown (detected by monitor)', entry.pid);
     }
   }
 }, 2000);
@@ -4103,6 +4160,27 @@ function truncateClaudeContext(claudeSessionId, targetContent, occurrence) {
   return { found: true, cleared: false, filePath };
 }
 
+// 读取 Claude 会话文件里所有人类轮次的可见文本，用于判断某条（或其后）消息是否真的存在于上下文中。
+// 文件缺失代表上下文已不存在，按空上下文处理。
+function readClaudeUserTurnTexts(claudeSessionId) {
+  const filePath = findClaudeSessionFile(claudeSessionId);
+  if (!filePath) return { fileMissing: true, texts: [] };
+
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return { fileMissing: true, texts: [] }; }
+
+  const texts = [];
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try { entry = JSON.parse(trimmed); } catch { continue; }
+    const text = extractClaudeUserTurnText(entry);
+    if (text !== null) texts.push(text);
+  }
+  return { fileMissing: false, texts };
+}
+
 // 找到某 thread 的全局 rollout 源文件（不含会话隔离副本）
 function findCodexSourceRollout(session) {
   const threadId = session?.codexThreadId;
@@ -4127,6 +4205,43 @@ function findCodexSourceRollout(session) {
     }
   } catch {}
   return null;
+}
+
+// Codex replays the persisted rollout on thread/resume. If a tool call was left without
+// its output (aborted turn) or had a synthetic user warning inserted between call and
+// output, strict upstream endpoints reject the whole history with "No tool output found
+// for tool call <id>". Repair the rollout first so a resumed session is replayable.
+function repairCodexRolloutBeforeResume(session) {
+  const threadId = session?.codexThreadId;
+  if (!threadId) return;
+  let filePath = null;
+  try {
+    filePath = findCodexSourceRollout(session);
+  } catch {}
+  if (!filePath) return;
+  // Only touch rollouts cc-web manages (the per-session CODEX_HOME or the global Codex
+  // sessions dir). Never silently rewrite an external rollout a user imported.
+  const resolved = path.resolve(filePath);
+  const homeDir = session?.codexHomeDir ? path.resolve(session.codexHomeDir) : null;
+  const inHome = homeDir ? (resolved === homeDir || resolved.startsWith(homeDir + path.sep)) : false;
+  const inGlobal = resolved === CODEX_SESSIONS_DIR || resolved.startsWith(CODEX_SESSIONS_DIR + path.sep);
+  if (!inHome && !inGlobal) return;
+  const result = repairRolloutFile(filePath);
+  if (result.changed) {
+    plog('INFO', 'codex_rollout_repaired', {
+      sessionId: String(session.id || '').slice(0, 8),
+      threadId,
+      moved: result.moved,
+      synthesized: result.synthesized,
+      filePath,
+    });
+  } else if (!result.ok && result.error) {
+    plog('WARN', 'codex_rollout_repair_fail', {
+      sessionId: String(session.id || '').slice(0, 8),
+      threadId,
+      error: result.error,
+    });
+  }
 }
 
 // 改完全局 rollout 后，删除会话隔离副本，使下次 resume 重新拷贝更新版
@@ -4760,9 +4875,27 @@ async function handleTruncateSession(ws, msg) {
     } else {
       const result = truncateClaudeContext(session.claudeSessionId, targetContent, occurrence);
       if (!result.found) {
-        return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
-      }
-      if (result.cleared) {
+        // 目标轮次可能从未写入 Claude 上下文（进程被中断、Claude 返回 “No response requested.”
+        // 而未持久化该轮），或本地上下文文件已不存在。只要目标及其之后的用户消息都不在上下文中，
+        // 截断上下文就是空操作，直接截断本地消息即可，无需中止以免重发按钮不可用。
+        const context = readClaudeUserTurnTexts(session.claudeSessionId);
+        const targetAndLater = messages.slice(index).filter((m) => m && m.role === 'user');
+        const stillInContext = !context.fileMissing
+          && targetAndLater.some((m) => context.texts.includes(m.content || ''));
+        if (stillInContext) {
+          return wsSend(ws, { type: 'error', message: '无法在上下文中定位该消息，已中止以避免破坏会话。请刷新后重试' });
+        }
+        plog('INFO', 'claude_truncate_context_absent', {
+          sessionId: sessionId.slice(0, 8),
+          fileMissing: !!context.fileMissing,
+          fromIndex: index,
+          removed: messages.length - index,
+        });
+        if (context.fileMissing) {
+          // 上下文文件已不存在，清掉失效的 runtime id，避免下次 --resume 指向空会话
+          session.claudeSessionId = null;
+        }
+      } else if (result.cleared) {
         deleteClaudeLocalSession(session.claudeSessionId);
         session.claudeSessionId = null;
       }
@@ -4978,6 +5111,121 @@ function handleAbort(ws) {
   // handleProcessComplete will be triggered by the PID monitor
 }
 
+// Spawn a Codex app-server process and register its message handling. Used for the
+// initial turn and for the automatic retry after a repaired tool-call mismatch.
+function startCodexAppServer({ ws, session, sessionId, spawnSpec, promptText, attachments, clientMessageId, entry: existingEntry = null }) {
+  const dir = runDir(sessionId);
+  fs.mkdirSync(dir, { recursive: true });
+  const errorPath = path.join(dir, 'error.log');
+  const errorFd = fs.openSync(errorPath, 'w');
+
+  let proc;
+  try {
+    proc = spawn(spawnSpec.command, spawnSpec.args, {
+      env: spawnSpec.env,
+      cwd: spawnSpec.cwd,
+      stdio: ['pipe', 'pipe', errorFd],
+      windowsHide: true,
+    });
+  } catch (err) {
+    fs.closeSync(errorFd);
+    cleanRunDir(sessionId);
+    plog('ERROR', 'process_spawn_fail', {
+      sessionId: sessionId.slice(0, 8),
+      error: err.message,
+      command: spawnSpec.command,
+      cwd: spawnSpec.cwd,
+    });
+    wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }), clientMessageId });
+    return null;
+  }
+  fs.closeSync(errorFd);
+
+  proc.on('error', (err) => {
+    plog('ERROR', 'process_spawn_fail', {
+      sessionId: sessionId.slice(0, 8),
+      error: err.message,
+      command: spawnSpec.command,
+      cwd: spawnSpec.cwd,
+    });
+    cleanRunDir(sessionId);
+    wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }), clientMessageId });
+  });
+
+  fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
+
+  plog('INFO', 'process_spawn', {
+    sessionId: sessionId.slice(0, 8),
+    pid: proc.pid,
+    agent: 'codex',
+    mode: spawnSpec.mode,
+    model: session?.model || 'default',
+    resume: spawnSpec.resume,
+    codexHomeDir: spawnSpec.codexHomeDir || null,
+    command: spawnSpec.command,
+    cwd: spawnSpec.cwd,
+    args: spawnSpec.args.join(' '),
+    appServer: true,
+  });
+
+  proc.on('exit', (code, signal) => {
+    plog('INFO', 'process_exit_event', {
+      sessionId: sessionId.slice(0, 8),
+      pid: proc.pid,
+      exitCode: code,
+      signal,
+    });
+    setTimeout(() => handleProcessComplete(sessionId, code, signal, proc.pid), 300);
+  });
+
+  const entry = existingEntry || {
+    pid: proc.pid,
+    ws,
+    agent: 'codex',
+    cwd: spawnSpec.cwd,
+    fullText: '',
+    attachments,
+    toolCalls: [],
+    lastCost: null,
+    lastUsage: null,
+    lastError: null,
+    errorSent: false,
+    codexHomeDir: spawnSpec.codexHomeDir || '',
+    codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
+    tailer: null,
+    appServer: true,
+  };
+  // Reset per-turn state so a retry starts clean while keeping cumulative usage.
+  entry.pid = proc.pid;
+  entry.ws = ws;
+  entry.agent = 'codex';
+  entry.cwd = spawnSpec.cwd;
+  entry.fullText = '';
+  entry.fullTextTruncated = false;
+  entry.toolCalls = [];
+  entry.toolCallsTruncated = false;
+  entry.lastError = null;
+  entry.errorSent = false;
+  entry.attachments = attachments;
+  entry.codexHomeDir = spawnSpec.codexHomeDir || '';
+  entry.codexRuntimeKey = spawnSpec.codexRuntimeKey || '';
+  entry.tailer = null;
+  entry.appServer = true;
+  entry.promptText = promptText || '';
+  activeProcesses.set(sessionId, entry);
+  sendSessionList(ws);
+
+  codexAppServer.attach(proc, {
+    session,
+    sessionId,
+    entry,
+    promptText: promptText || '',
+    attachments,
+    spec: spawnSpec,
+  });
+  return entry;
+}
+
 // === Runtime Message Handler ===
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
@@ -5125,102 +5373,23 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.error) {
     return wsSend(ws, { type: 'error', message: spawnSpec.error, clientMessageId });
   }
+  if (spawnSpec.appServer && spawnSpec.resume) {
+    repairCodexRolloutBeforeResume(session);
+  }
   saveSession(session);
 
   // === Codex app-server: persistent bidirectional process (approval guard) ===
   // Unlike the detached exec path below, we keep stdin open to drive the JSON-RPC turn
   // and relay approval decisions. This process does NOT survive a Node.js restart.
   if (spawnSpec.appServer) {
-    const dir = runDir(currentSessionId);
-    fs.mkdirSync(dir, { recursive: true });
-    const errorPath = path.join(dir, 'error.log');
-    const errorFd = fs.openSync(errorPath, 'w');
-
-    let proc;
-    try {
-      proc = spawn(spawnSpec.command, spawnSpec.args, {
-        env: spawnSpec.env,
-        cwd: spawnSpec.cwd,
-        stdio: ['pipe', 'pipe', errorFd],
-        windowsHide: true,
-      });
-    } catch (err) {
-      fs.closeSync(errorFd);
-      cleanRunDir(currentSessionId);
-      plog('ERROR', 'process_spawn_fail', {
-        sessionId: currentSessionId.slice(0, 8),
-        error: err.message,
-        command: spawnSpec.command,
-        cwd: spawnSpec.cwd,
-      });
-      return wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }), clientMessageId });
-    }
-    fs.closeSync(errorFd);
-
-    proc.on('error', (err) => {
-      plog('ERROR', 'process_spawn_fail', {
-        sessionId: currentSessionId.slice(0, 8),
-        error: err.message,
-        command: spawnSpec.command,
-        cwd: spawnSpec.cwd,
-      });
-      cleanRunDir(currentSessionId);
-      wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err.message, { exitCode: null, signal: null }), clientMessageId });
-    });
-
-    fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
-
-    plog('INFO', 'process_spawn', {
-      sessionId: currentSessionId.slice(0, 8),
-      pid: proc.pid,
-      agent: 'codex',
-      mode: spawnSpec.mode,
-      model: session.model || 'default',
-      resume: spawnSpec.resume,
-      codexHomeDir: spawnSpec.codexHomeDir || null,
-      command: spawnSpec.command,
-      cwd: spawnSpec.cwd,
-      args: spawnSpec.args.join(' '),
-      appServer: true,
-    });
-
-    proc.on('exit', (code, signal) => {
-      plog('INFO', 'process_exit_event', {
-        sessionId: currentSessionId.slice(0, 8),
-        pid: proc.pid,
-        exitCode: code,
-        signal,
-      });
-      setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
-    });
-
-    const entry = {
-      pid: proc.pid,
+    startCodexAppServer({
       ws,
-      agent: 'codex',
-      cwd: spawnSpec.cwd,
-      fullText: '',
-      attachments: resolvedAttachments,
-      toolCalls: [],
-      lastCost: null,
-      lastUsage: null,
-      lastError: null,
-      errorSent: false,
-      codexHomeDir: spawnSpec.codexHomeDir || '',
-      codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
-      tailer: null,
-      appServer: true,
-    };
-    activeProcesses.set(currentSessionId, entry);
-    sendSessionList(ws);
-
-    codexAppServer.attach(proc, {
       session,
       sessionId: currentSessionId,
-      entry,
+      spawnSpec,
       promptText: textValue,
       attachments: resolvedAttachments,
-      spec: spawnSpec,
+      clientMessageId,
     });
     return;
   }
@@ -5343,7 +5512,7 @@ function handleMessage(ws, msg, options = {}) {
       signal: signal,
     });
     // Small delay to ensure file is fully flushed
-    setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
+    setTimeout(() => handleProcessComplete(currentSessionId, code, signal, proc.pid), 300);
   });
 
   const entry = {
@@ -5574,6 +5743,7 @@ const {
   parseCodexRolloutLines,
   getCodexRolloutFiles,
   parseCodexRolloutFile,
+  repairRolloutFile,
 } = createCodexRolloutStore({
   codexSessionsDir: CODEX_SESSIONS_DIR,
   sanitizeToolInput,

@@ -135,6 +135,29 @@ function runTurn(id, params) {
     try { fs.unlinkSync(statePath(state.threadId)); } catch {}
   }
 
+  // First attempt leaves a tool call and its output misaligned in the rollout and fails
+  // the way strict upstream endpoints do; cc-web should repair the rollout and retry,
+  // after which this same thread completes normally.
+  if (text === 'trigger codex tool output mismatch') {
+    if (!threadState.toolOutputMismatchRetried) {
+      const callId = 'call_mock_mismatch';
+      appendRollout({ timestamp, type: 'response_item', payload: { type: 'function_call', name: 'exec_command', arguments: '{}', call_id: callId } });
+      appendRollout({ timestamp, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Warning: apply_patch was requested via exec_command.' }] } });
+      appendRollout({ timestamp, type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output: 'ok' } });
+      saveThreadState({ ...threadState, toolOutputMismatchRetried: true });
+      notify('turn/completed', {
+        threadId: state.threadId,
+        turn: {
+          id: turnId,
+          status: 'failed',
+          error: { message: `No tool output found for tool call ${callId}. (request_id: mock) [trace_id=mock]` },
+        },
+      });
+      return;
+    }
+    try { fs.unlinkSync(statePath(state.threadId)); } catch {}
+  }
+
   const responseText = text === '/compact'
     ? 'Codex compact finished.'
     : isInitPrompt
