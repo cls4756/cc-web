@@ -21,9 +21,10 @@ function item(obj) { return { type: 'response_item', payload: obj }; }
   const output = item({ type: 'function_call_output', call_id: 'call_A', output: 'ok' });
   const before = item({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'applying' }] });
 
-  const { entries, moved, synthesized } = repairToolCallPairing([before, call, warning, output]);
+  const { entries, moved, synthesized, applyPatchWarnings } = repairToolCallPairing([before, call, warning, output]);
   assert.strictEqual(moved, 1, 'inserted warning should count as one relocation');
   assert.strictEqual(synthesized, 0);
+  assert.strictEqual(applyPatchWarnings, 1, 'the synthetic apply_patch warning should be reported');
   assert.deepStrictEqual(entries.map((e) => e.payload.type), ['message', 'function_call', 'function_call_output', 'message']);
   assert.strictEqual(entries[2], output, 'output must immediately follow its call');
   assert.strictEqual(entries[3], warning, 'warning is preserved, just moved after the output');
@@ -33,9 +34,10 @@ function item(obj) { return { type: 'response_item', payload: obj }; }
 {
   const call = item({ type: 'function_call', call_id: 'call_B', name: 'exec_command', arguments: '{}' });
   const output = item({ type: 'function_call_output', call_id: 'call_B', output: 'ok' });
-  const { entries, moved, synthesized } = repairToolCallPairing([call, output]);
+  const { entries, moved, synthesized, applyPatchWarnings } = repairToolCallPairing([call, output]);
   assert.strictEqual(moved, 0);
   assert.strictEqual(synthesized, 0);
+  assert.strictEqual(applyPatchWarnings, 0);
   assert.deepStrictEqual(entries, [call, output]);
 }
 
@@ -78,6 +80,7 @@ function item(obj) { return { type: 'response_item', payload: obj }; }
   const first = repairRolloutFile(file);
   assert.strictEqual(first.changed, true);
   assert.strictEqual(first.moved, 1);
+  assert.strictEqual(first.applyPatchWarnings, 0, 'a generic warning is not the apply_patch one');
 
   const written = fs.readFileSync(file, 'utf8').split('\n').map((l) => JSON.parse(l));
   assert.strictEqual(written[0].type, 'session_meta');
@@ -87,6 +90,7 @@ function item(obj) { return { type: 'response_item', payload: obj }; }
 
   const second = repairRolloutFile(file);
   assert.strictEqual(second.changed, false, 'idempotent: a repaired file is left alone');
+  assert.strictEqual(second.applyPatchWarnings, 0);
   fs.rmSync(dir, { recursive: true, force: true });
 }
 

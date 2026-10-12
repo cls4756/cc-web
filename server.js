@@ -1992,11 +1992,19 @@ function formatRuntimeError(agent, raw, context = {}) {
     if (/stream disconnected before completion|stream closed before response\.completed|response\.completed/i.test(condensed)) {
       return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流式协议没有完整发送 response.completed。请检查该 API 端点是否完整兼容 OpenAI Responses SSE，或切回确认兼容的 API 模板。';
     }
-    // A tool call whose output is missing/misplaced poisons the whole replayed history:
-    // every later turn fails the same way until the rollout is repaired. cc-web fixes the
-    // pairing before the next resume, so the user only needs to resend.
+    // A tool call whose output is missing/misplaced poisons the replayed history. cc-web
+    // repairs the stored rollout before the next resume, but it cannot reorder the request
+    // Codex builds mid-turn: if the model keeps running `apply_patch` through exec_command,
+    // Codex injects a synthetic user warning between the call and its output and strict
+    // Responses endpoints reject it again on every turn. Say so instead of promising that
+    // resending will fix it.
     if (/no tool output found for tool call|output is missing for call id/i.test(condensed)) {
-      return `Codex 上下文中的工具调用与结果不匹配（缺少或错位），上游拒绝了本次请求：${firstMeaningfulLine(condensed)}。cc-web 会在下次发送时自动修复上下文，请直接重新发送或回复「继续」即可。`;
+      if (context.toolMismatchRetried) {
+        return `Codex 上下文里的工具调用与结果仍然错位，自动修复并重试后上游依旧拒绝：${firstMeaningfulLine(condensed)}。`
+          + '这通常不是历史残留：模型在当前回合用 exec_command 执行了 apply_patch，Codex 会在工具调用和结果之间插入一条提醒，而当前 API 端点要求两者必须紧挨，于是判定“缺少工具结果”。'
+          + '只要模型继续这样调用，重复重发就会反复触发。建议改用原生支持 apply_patch 工具的模型（如 gpt-5.x-codex 系列），或更换兼容性更好的 API 端点/模板。';
+      }
+      return `Codex 上下文中的工具调用与结果不匹配（缺少或错位），上游拒绝了本次请求：${firstMeaningfulLine(condensed)}。cc-web 会在下次发送时自动修复已保存的上下文。`;
     }
     // Must not match "unexpected status 404 Not Found" from the upstream API, which is a
     // model/endpoint problem rather than a missing binary.
@@ -2133,7 +2141,7 @@ function handleProcessComplete(sessionId, exitCode, signal, expectedPid = null) 
       : null
   );
   contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
-  const completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
+  const completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal, toolMismatchRetried: !!entry.autoRetryAttempted }) : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
   plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
@@ -2174,10 +2182,13 @@ function handleProcessComplete(sessionId, exitCode, signal, expectedPid = null) 
       const retrySpec = buildCodexSpawnSpec(retrySession, { attachments: retryAttachments });
       if (!retrySpec?.error && retrySpec.appServer) {
         if (entry.tailer) { try { entry.tailer.stop(); } catch {} entry.tailer = null; }
-        repairCodexRolloutBeforeResume(retrySession);
+        const repairResult = repairCodexRolloutBeforeResume(retrySession);
         plog('INFO', 'codex_tool_output_mismatch_retry', {
           sessionId: sessionId.slice(0, 8),
           threadId: retrySession.codexThreadId || null,
+          moved: repairResult?.moved || 0,
+          synthesized: repairResult?.synthesized || 0,
+          applyPatchWarnings: repairResult?.applyPatchWarnings || 0,
         });
         wsSend(entry.ws, { type: 'system_message', message: '检测到 Codex 上下文里的工具调用与结果错位，已自动修复并重试本次请求…' });
         startCodexAppServer({
@@ -4213,19 +4224,19 @@ function findCodexSourceRollout(session) {
 // for tool call <id>". Repair the rollout first so a resumed session is replayable.
 function repairCodexRolloutBeforeResume(session) {
   const threadId = session?.codexThreadId;
-  if (!threadId) return;
+  if (!threadId) return null;
   let filePath = null;
   try {
     filePath = findCodexSourceRollout(session);
   } catch {}
-  if (!filePath) return;
+  if (!filePath) return null;
   // Only touch rollouts cc-web manages (the per-session CODEX_HOME or the global Codex
   // sessions dir). Never silently rewrite an external rollout a user imported.
   const resolved = path.resolve(filePath);
   const homeDir = session?.codexHomeDir ? path.resolve(session.codexHomeDir) : null;
   const inHome = homeDir ? (resolved === homeDir || resolved.startsWith(homeDir + path.sep)) : false;
   const inGlobal = resolved === CODEX_SESSIONS_DIR || resolved.startsWith(CODEX_SESSIONS_DIR + path.sep);
-  if (!inHome && !inGlobal) return;
+  if (!inHome && !inGlobal) return null;
   const result = repairRolloutFile(filePath);
   if (result.changed) {
     plog('INFO', 'codex_rollout_repaired', {
@@ -4233,6 +4244,7 @@ function repairCodexRolloutBeforeResume(session) {
       threadId,
       moved: result.moved,
       synthesized: result.synthesized,
+      applyPatchWarnings: result.applyPatchWarnings || 0,
       filePath,
     });
   } else if (!result.ok && result.error) {
@@ -4242,6 +4254,7 @@ function repairCodexRolloutBeforeResume(session) {
       error: result.error,
     });
   }
+  return result;
 }
 
 // 改完全局 rollout 后，删除会话隔离副本，使下次 resume 重新拷贝更新版

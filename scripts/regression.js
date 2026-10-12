@@ -650,6 +650,11 @@ async function main() {
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === mismatchSession.sessionId, 20000);
     const mismatchLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
     assert(mismatchLog.includes('codex_tool_output_mismatch_retry'), 'Codex tool-output mismatch retry should be logged');
+    const mismatchRetryLine = mismatchLog
+      .trim()
+      .split('\n')
+      .find((line) => line.includes('"event":"codex_tool_output_mismatch_retry"'));
+    assert(mismatchRetryLine && /"applyPatchWarnings":1/.test(mismatchRetryLine), 'Codex mismatch retry should attribute the wedge to the synthetic apply_patch warning');
     const mismatchSpawns = mismatchLog
       .trim()
       .split('\n')
