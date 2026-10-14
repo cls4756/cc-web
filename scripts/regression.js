@@ -609,6 +609,9 @@ async function main() {
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
     assert(runtimeToml.includes('base_url = "https://example.org/v1"'), 'Codex custom profile should write isolated runtime base_url');
     assert(runtimeToml.includes('model = "gpt-5.4"'), 'Codex custom profile should write isolated runtime model');
+    assert(runtimeToml.includes('developer_instructions = '), 'Codex custom profile should inject developer instructions');
+    assert(/\[features\][\s\S]*apply_patch_freeform = true/.test(runtimeToml), 'Codex custom profile should enable the freeform apply_patch tool');
+    assert(runtimeToml.includes('Never invoke the `apply_patch` command through `exec_command`'), 'Developer instructions should steer the model to the apply_patch tool');
 
     ws.send(JSON.stringify({ type: 'message', text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /正在执行/.test(msg.message || '') && /Codex \/compact/.test(msg.message || ''));

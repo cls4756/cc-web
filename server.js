@@ -755,6 +755,14 @@ const VALID_AGENTS = new Set(['claude', 'codex']);
 // 3) this constant
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 
+// Injected as a developer-role message into every custom-profile Codex session. Non-OpenAI
+// models tend to shell out to run `apply_patch`; Codex then injects a synthetic reminder
+// between the tool call and its output, which strict Responses endpoints reject with
+// "No tool output found for tool call ...". The dedicated tool only exists in the tool list
+// when the apply_patch_freeform feature is on (see the [features] block below), so enable
+// both together or the instruction cannot be followed.
+const CODEX_DEVELOPER_INSTRUCTIONS = 'For every file edit (create, modify, move, delete) use the dedicated `apply_patch` tool. Never invoke the `apply_patch` command through `exec_command` or any shell command.';
+
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
   mode: 'local',      // 'local' | 'custom'
@@ -1143,12 +1151,18 @@ function prepareCodexCustomRuntime(config, session = null) {
     'model_provider = "openai_compat"',
     ...(modelSpec.base ? [`model = ${tomlString(modelSpec.base)}`] : []),
     ...(modelSpec.reasoning ? [`model_reasoning_effort = ${tomlString(modelSpec.reasoning)}`] : []),
+    `developer_instructions = ${tomlString(CODEX_DEVELOPER_INSTRUCTIONS)}`,
     '',
     '[model_providers.openai_compat]',
     `name = ${tomlString(activeProfile.name || 'OpenAI Compat')}`,
     `base_url = ${tomlString(runtimeApiBase)}`,
     'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
+    '',
+    // Custom providers are not offered the dedicated apply_patch tool by default, so the
+    // model shells out to run apply_patch and Codex splits the call/output with a reminder.
+    '[features]',
+    'apply_patch_freeform = true',
     '',
   ].join('\n');
   fs.writeFileSync(path.join(homeDir, 'config.toml'), configToml);
